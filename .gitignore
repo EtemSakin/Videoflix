@@ -1,0 +1,34 @@
+# Secrets and local environment files.
+.env
+.env.*
+!.env.example
+
+# Python environments, bytecode, and test or analysis output.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Local databases, logs, and generated media.
+*.sqlite3
+*.sqlite3-journal
+*.log
+/media/
+/staticfiles/
+*.m3u8
+*.ts
+
+# Editor and operating system files.
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
