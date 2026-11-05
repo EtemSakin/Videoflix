@@ -1,7 +1,9 @@
 """Tests for the video catalog model."""
 
+import subprocess
 from datetime import timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from django.conf import settings
@@ -30,8 +32,11 @@ from videos.cache import VIDEO_CATALOG_CACHE_KEY
 from videos.models import Video
 from videos.transcoding import (
     HLS_PROFILES,
+    FFmpegUnavailableError,
+    HLSConversionError,
     build_hls_command,
     get_hls_profile,
+    transcode_hls_rendition,
 )
 from videos.validators import validate_file_name
 
@@ -83,6 +88,15 @@ def hls_output_paths(directory):
     return str(root / "segment_%05d.ts"), str(root / "index.m3u8")
 
 
+def fake_ffmpeg_success(command, **options):
+    """Write representative HLS artifacts for process-wrapper tests."""
+    segment_pattern = Path(command[command.index("-hls_segment_filename") + 1])
+    segment_pattern.parent.mkdir(parents=True, exist_ok=True)
+    (segment_pattern.parent / "segment_00000.ts").write_bytes(b"segment")
+    Path(command[-1]).write_text("#EXTM3U\nsegment_00000.ts\n")
+    return subprocess.CompletedProcess(command, 0)
+
+
 class HLSCommandBuilderTests(SimpleTestCase):
     """Verify rendition profiles and shell-safe FFmpeg arguments."""
 
@@ -105,12 +119,53 @@ class HLSCommandBuilderTests(SimpleTestCase):
             (command[segment_index], command[-1]), expected_paths
         ):
             self.assertEqual(actual, expected)
-        self.assertIn("scale=-2:min(ih\\,720)", command)
+        self.assertIn("scale=-2:720", command)
 
     def test_builder_rejects_unsupported_resolution(self):
         """Reject arbitrary resolution text before forming FFmpeg options."""
         with self.assertRaises(ValueError):
             build_hls_command("source.mp4", "output", "720p;touch")
+
+    def test_successful_conversion_publishes_manifest_and_segments(self):
+        """Publish a rendition only after FFmpeg produced its artifacts."""
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            with patch(
+                "videos.transcoding.subprocess.run",
+                side_effect=fake_ffmpeg_success,
+            ) as run:
+                output = transcode_hls_rendition(source, root / "hls", "480p")
+                self.assertTrue((output / "index.m3u8").is_file())
+                self.assertTrue((output / "segment_00000.ts").is_file())
+                self.assertFalse(run.call_args.kwargs["shell"])
+
+    def test_missing_ffmpeg_is_reported_and_staging_is_removed(self):
+        """Translate a missing executable without leaving partial output."""
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            with patch(
+                "videos.transcoding.subprocess.run",
+                side_effect=FileNotFoundError,
+            ):
+                with self.assertRaises(FFmpegUnavailableError):
+                    transcode_hls_rendition(source, root / "hls", "480p")
+            self.assertEqual(list((root / "hls").iterdir()), [])
+
+    def test_failed_ffmpeg_process_does_not_publish_partial_output(self):
+        """Discard staged files when FFmpeg exits unsuccessfully."""
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.mp4"
+            source.write_bytes(b"source")
+            error = subprocess.CalledProcessError(1, "ffmpeg")
+            with patch("videos.transcoding.subprocess.run", side_effect=error):
+                with self.assertRaises(HLSConversionError):
+                    transcode_hls_rendition(source, root / "hls", "480p")
+            self.assertFalse((root / "hls" / "480p").exists())
 
 
 class VideoModelTests(TestCase):
