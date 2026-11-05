@@ -37,7 +37,11 @@ from rest_framework_simplejwt.tokens import AccessToken
 from videos.admin import VideoAdmin, VideoAdminForm
 from videos.cache import VIDEO_CATALOG_CACHE_KEY
 from videos.models import Video
-from videos.tasks import enqueue_video_processing, process_video
+from videos.tasks import (
+    enqueue_video_processing,
+    process_video,
+    update_video_status,
+)
 from videos.thumbnails import (
     ThumbnailGenerationError,
     build_thumbnail_command,
@@ -257,6 +261,14 @@ class HLSCommandBuilderTests(SimpleTestCase):
                 with self.assertRaises(FFmpegUnavailableError):
                     transcode_hls_rendition(source, root / "hls", "480p")
             self.assertEqual(list((root / "hls").iterdir()), [])
+
+    def test_missing_source_is_rejected_before_running_ffmpeg(self):
+        """Reject a deleted source file before creating rendition output."""
+        with TemporaryDirectory() as temporary:
+            with self.assertRaises(FileNotFoundError):
+                transcode_hls_rendition(
+                    Path(temporary) / "missing.mp4", temporary, "480p"
+                )
 
     def test_failed_ffmpeg_process_does_not_publish_partial_output(self):
         """Discard staged files when FFmpeg exits unsuccessfully."""
@@ -548,6 +560,36 @@ class VideoProcessingStatusTests(TestCase):
             self.assertEqual(process_video(video.pk), [])
         transcode.assert_not_called()
 
+    def test_lost_processing_claim_cleans_completed_renditions(self):
+        """Remove generated files when another actor changes the state."""
+        video = self.create_pending_video()
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "hls"
+            with override_settings(VIDEO_HLS_ROOT=root):
+                self.assert_lost_claim_fails_and_cleans(video, root)
+
+    def assert_lost_claim_fails_and_cleans(self, video, root):
+        """Verify a lost worker claim raises and removes its output."""
+        converter = patch(
+            "videos.tasks.transcode_hls_rendition",
+            side_effect=self.create_mock_profile,
+        )
+        readiness = patch(
+            "videos.tasks.mark_processing_ready", return_value=False
+        )
+        with converter, readiness:
+            with self.assertRaisesRegex(RuntimeError, "state changed"):
+                process_video(video.pk)
+        self.assertEqual(list((root / str(video.pk)).iterdir()), [])
+
+    def test_status_transition_returns_false_for_missing_row(self):
+        """Report that a lifecycle transition could not find its row."""
+        self.assertFalse(
+            update_video_status(
+                99999, Video.STATUS_PROCESSING, Video.STATUS_READY
+            )
+        )
+
 
 class VideoProcessingConcurrencyTests(TransactionTestCase):
     """Verify concurrent PostgreSQL workers cannot double-claim a video."""
@@ -593,6 +635,10 @@ class VideoModelTests(TestCase):
         self.assertEqual(video.description, "A short description.")
         self.assertEqual(video.category, "Drama")
         self.assertIsNotNone(video.created_at)
+
+    def test_string_representation_uses_the_video_title(self):
+        """Show a readable title for a video in Django Admin and logs."""
+        self.assertEqual(str(self.create_video()), "A sample film")
 
     def test_video_defaults_to_pending_processing_state(self):
         """Mark new uploads pending until background conversion completes."""
@@ -656,6 +702,16 @@ class VideoAdminTests(TestCase):
         """Accept a supported video and optional image thumbnail."""
         form = self.admin_form("sample.MP4", "preview.webp")
         self.assertTrue(form.is_valid(), form.errors)
+
+    def test_admin_form_accepts_matroska_and_webm_signatures(self):
+        """Accept container signatures matching Matroska and WebM names."""
+        header = b"\x1a\x45\xdf\xa3\x00\x00"
+        samples = (("sample.mkv", header + b"matroska"),)
+        samples += (("sample.webm", header + b"webm"),)
+        for filename, content in samples:
+            with self.subTest(filename=filename):
+                form = self.admin_form(filename, content=content)
+                self.assertTrue(form.is_valid(), form.errors)
 
     def test_admin_form_rejects_unsupported_video_extension(self):
         """Reject an executable upload renamed as an unsupported format."""

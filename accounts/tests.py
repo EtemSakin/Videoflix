@@ -39,6 +39,7 @@ from accounts.emails import (
     EmailDeliveryError,
     build_activation_url,
     build_password_reset_url,
+    send_password_reset_email,
 )
 from accounts.serializers import (
     PasswordResetConfirmSerializer,
@@ -371,6 +372,18 @@ class RegistrationEndpointTests(APITestCase):
         )
         user_exists = User.objects.filter(email="filmfan@example.com").exists()
         self.assertFalse(user_exists)
+
+    def test_zero_sent_activation_emails_roll_back_registration(self):
+        """Treat an SMTP backend sending no message as delivery failure."""
+        send_path = "accounts.emails.EmailMultiAlternatives.send"
+        with patch(send_path, return_value=0):
+            response = self.submit_registration()
+        self.assertEqual(
+            response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        self.assertFalse(
+            User.objects.filter(email="filmfan@example.com").exists()
+        )
 
     def test_concurrent_email_conflict_returns_controlled_error(self):
         """Return a safe response for a concurrent email uniqueness error."""
@@ -1040,6 +1053,21 @@ class PasswordResetRequestTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
         self.assertEqual(mail.outbox, [])
+
+    def test_zero_sent_reset_emails_keep_the_generic_response(self):
+        """Treat an SMTP backend sending no reset message as a failure."""
+        send_path = "accounts.emails.EmailMultiAlternatives.send"
+        with patch(send_path, return_value=0):
+            with self.assertLogs("accounts.views", level="ERROR"):
+                response = self.submit_request()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
+
+    def test_missing_reset_sender_configuration_fails_safely(self):
+        """Reject incomplete mail settings before constructing an email."""
+        with override_settings(DEFAULT_FROM_EMAIL=""):
+            with self.assertRaises(EmailDeliveryError):
+                send_password_reset_email(self.user)
 
 
 @override_settings(
