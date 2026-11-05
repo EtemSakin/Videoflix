@@ -35,6 +35,11 @@ from videos.admin import VideoAdmin, VideoAdminForm
 from videos.cache import VIDEO_CATALOG_CACHE_KEY
 from videos.models import Video
 from videos.tasks import enqueue_video_processing, process_video
+from videos.thumbnails import (
+    ThumbnailGenerationError,
+    build_thumbnail_command,
+    generate_video_thumbnail,
+)
 from videos.transcoding import (
     HLS_PROFILES,
     FFmpegUnavailableError,
@@ -84,6 +89,15 @@ def new_admin_video():
     )
 
 
+def create_concurrent_video():
+    """Create the database row shared by duplicate worker connections."""
+    return Video.objects.create(
+        title="Concurrent film",
+        category="Drama",
+        video_file="videos/source/concurrent.mp4",
+    )
+
+
 def admin_uploads(filename, thumbnail, content):
     """Build source and optional WebP uploads for admin form tests."""
     files = {"video_file": SimpleUploadedFile(filename, content)}
@@ -117,6 +131,12 @@ def fake_ffmpeg_success(command, **options):
 def mock_hls_output(_source, root, resolution):
     """Return the expected profile path in mocked worker tests."""
     return root / resolution
+
+
+def fake_thumbnail_success(command, **options):
+    """Write a representative JPEG for thumbnail process tests."""
+    Path(command[-1]).write_bytes(b"\xff\xd8\xffpreview")
+    return subprocess.CompletedProcess(command, 0)
 
 
 def process_video_in_thread(video_id):
@@ -248,8 +268,95 @@ class HLSCommandBuilderTests(SimpleTestCase):
             self.assertFalse((root / "hls" / "480p").exists())
 
 
+class ThumbnailGenerationTests(SimpleTestCase):
+    """Verify thumbnail paths, safe arguments, and temporary output cleanup."""
+
+    def thumbnail_source(self):
+        """Create temporary source and media paths for thumbnail tests."""
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source = root / "source.mp4"
+        source.write_bytes(b"source")
+        media_root = root / "media"
+        self.enterContext(override_settings(
+            MEDIA_ROOT=media_root,
+            VIDEO_THUMBNAIL_ROOT=media_root / "videos" / "thumbnails",
+        ))
+        return source, media_root
+
+    def test_builder_uses_absolute_paths_and_a_single_jpeg_frame(self):
+        """Keep user-controlled paths in argv and select a preview frame."""
+        command = build_thumbnail_command("source;touch", "output/preview.jpg")
+        self.assertIn(str(Path("source;touch").resolve()), command)
+        output_path = str(Path("output/preview.jpg").resolve())
+        self.assertEqual(command[-1], output_path)
+        self.assertIn("thumbnail,scale=640:-2", command)
+        self.assertEqual(command[command.index("-frames:v") + 1], "1")
+
+    def test_generation_rejects_thumbnail_paths_outside_media_root(self):
+        """Prevent thumbnail configuration from escaping private storage."""
+        source, media_root = self.thumbnail_source()
+        self.enterContext(
+            override_settings(
+                VIDEO_THUMBNAIL_ROOT=media_root.parent / "outside"
+            )
+        )
+        with self.assertRaises(ThumbnailGenerationError):
+            generate_video_thumbnail(source, 22)
+
+    def test_generation_stores_a_media_relative_name_and_reuses_output(self):
+        """Publish the JPEG atomically and skip duplicate generation."""
+        source, media_root = self.thumbnail_source()
+        with patch(
+            "videos.transcoding.subprocess.run",
+            side_effect=fake_thumbnail_success,
+        ) as run:
+            name = generate_video_thumbnail(source, 19)
+            reused = generate_video_thumbnail(source, 19)
+        self.assertEqual(name, "videos/thumbnails/19/thumbnail.jpg")
+        self.assertEqual(reused, name)
+        self.assertTrue((media_root / name).is_file())
+        self.assertEqual(run.call_count, 1)
+
+    def test_missing_ffmpeg_removes_temporary_thumbnail_files(self):
+        """Report missing FFmpeg and leave no public-looking partial output."""
+        source, media_root = self.thumbnail_source()
+        with patch(
+            "videos.transcoding.subprocess.run",
+            side_effect=FileNotFoundError,
+        ):
+            with self.assertRaises(FFmpegUnavailableError):
+                generate_video_thumbnail(source, 20)
+        self.assertEqual(
+            list((media_root / "videos" / "thumbnails" / "20").iterdir()),
+            [],
+        )
+
+    def test_failed_thumbnail_command_is_wrapped_and_cleaned(self):
+        """Keep process errors controlled and remove temporary directories."""
+        source, media_root = self.thumbnail_source()
+        error = subprocess.CalledProcessError(1, "ffmpeg")
+        with patch("videos.transcoding.subprocess.run", side_effect=error):
+            with self.assertRaises(ThumbnailGenerationError):
+                generate_video_thumbnail(source, 21)
+        self.assertEqual(
+            list((media_root / "videos" / "thumbnails" / "21").iterdir()),
+            [],
+        )
+
+
 class VideoQueueTests(TestCase):
     """Verify admin-triggered work is deferred to the RQ worker."""
+
+    def setUp(self):
+        """Replace thumbnail FFmpeg with a stable queued-job result."""
+        patcher = patch(
+            "videos.tasks.generate_video_thumbnail",
+            return_value="videos/thumbnails/test/thumbnail.jpg",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_admin_enqueues_new_video_only_after_database_commit(self):
         """Register queue submission as an on-commit callback."""
@@ -292,10 +399,9 @@ class VideoQueueTests(TestCase):
             category="Drama",
             video_file="videos/source/worker.mp4",
         )
-        with patch("videos.tasks.transcode_hls_rendition") as transcode:
-            transcode.side_effect = (
-                lambda _source, root, resolution: root / resolution
-            )
+        with patch(
+            "videos.tasks.transcode_hls_rendition", side_effect=mock_hls_output
+        ) as transcode:
             outputs = process_video(video.pk)
         self.assertEqual(len(outputs), 3)
         self.assertEqual(transcode.call_count, 3)
@@ -303,6 +409,15 @@ class VideoQueueTests(TestCase):
 
 class VideoProcessingStatusTests(TestCase):
     """Verify worker jobs persist valid video processing transitions."""
+
+    def setUp(self):
+        """Keep status tests independent of the FFmpeg thumbnail binary."""
+        patcher = patch(
+            "videos.tasks.generate_video_thumbnail",
+            return_value="videos/thumbnails/test/thumbnail.jpg",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def create_pending_video(self):
         """Create a row that is eligible for one conversion job."""
@@ -321,6 +436,30 @@ class VideoProcessingStatusTests(TestCase):
         video.refresh_from_db()
         self.assertEqual(video.status, Video.STATUS_READY)
         self.assertEqual(len(outputs), 3)
+        self.assertEqual(
+            video.thumbnail.name,
+            "videos/thumbnails/test/thumbnail.jpg",
+        )
+
+    def test_thumbnail_failure_marks_video_failed(self):
+        """Do not expose completed HLS output without its required preview."""
+        video = self.create_pending_video()
+        with patch(
+            "videos.tasks.transcode_hls_rendition",
+            side_effect=mock_hls_output,
+        ):
+            with patch(
+                "videos.tasks.generate_video_thumbnail",
+                side_effect=ThumbnailGenerationError,
+            ):
+                with self.assertRaises(ThumbnailGenerationError):
+                    process_video(video.pk)
+        self.assert_video_failed(video)
+
+    def assert_video_failed(self, video):
+        """Refresh and verify a worker failure was saved to PostgreSQL."""
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_FAILED)
 
     def test_status_transitions_schedule_catalog_cache_invalidation(self):
         """Invalidate cached listings when processing status is saved."""
@@ -335,7 +474,7 @@ class VideoProcessingStatusTests(TestCase):
                     side_effect=mock_hls_output,
                 ):
                     process_video(video.pk)
-        self.assertEqual(clear.call_count, 2)
+        self.assertEqual(clear.call_count, 3)
 
     def test_conversion_failure_marks_video_failed(self):
         """Persist failure before returning the worker exception to RQ."""
@@ -363,13 +502,18 @@ class VideoProcessingStatusTests(TestCase):
 class VideoProcessingConcurrencyTests(TransactionTestCase):
     """Verify concurrent PostgreSQL workers cannot double-claim a video."""
 
+    def setUp(self):
+        """Replace thumbnail generation in concurrent worker tests."""
+        patcher = patch(
+            "videos.tasks.generate_video_thumbnail",
+            return_value="videos/thumbnails/test/thumbnail.jpg",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_duplicate_jobs_transcode_only_once_across_connections(self):
         """Lock the pending row while a second worker attempts to claim it."""
-        video = Video.objects.create(
-            title="Concurrent film",
-            category="Drama",
-            video_file="videos/source/concurrent.mp4",
-        )
+        video = create_concurrent_video()
         completed, duplicate, calls = run_concurrent_conversion(video.pk)
         video.refresh_from_db()
         self.assertEqual(len(completed), 3)

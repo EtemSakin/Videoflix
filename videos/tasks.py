@@ -8,6 +8,7 @@ from django.db import transaction
 from redis.exceptions import RedisError
 
 from videos.models import Video
+from videos.thumbnails import generate_video_thumbnail
 from videos.transcoding import HLS_PROFILES, transcode_hls_rendition
 
 logger = logging.getLogger(__name__)
@@ -41,8 +42,14 @@ def process_video(video_id):
     if claimed is None:
         return []
     source, output_root = claimed
+    return complete_video_processing(video_id, source, output_root)
+
+
+def complete_video_processing(video_id, source, output_root):
+    """Convert media and persist thumbnail and processing status."""
     try:
         outputs = convert_video(source, output_root)
+        attach_video_thumbnail(video_id, source)
     except Exception:
         mark_processing_failed(video_id)
         raise
@@ -68,6 +75,13 @@ def convert_video(source, output_root):
         str(transcode_hls_rendition(source, output_root, resolution))
         for resolution in HLS_PROFILES
     ]
+
+
+def attach_video_thumbnail(video_id, source):
+    """Store the generated private thumbnail on its catalog row."""
+    video = Video.objects.get(pk=video_id)
+    video.thumbnail.name = generate_video_thumbnail(source, video_id)
+    video.save(update_fields=("thumbnail",))
 
 
 def update_video_status(video_id, expected_status, new_status):
