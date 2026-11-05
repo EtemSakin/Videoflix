@@ -1,28 +1,14 @@
 """Admin configuration for secure video catalog management."""
 
-from pathlib import Path
-
 from django import forms
-from django.conf import settings
 from django.contrib import admin
-from django.core.exceptions import ValidationError
 
 from videos.models import Video
-
-VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".mkv", ".webm"}
-THUMBNAIL_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-
-
-def validate_upload(upload, allowed_extensions):
-    """Reject empty, unsupported, or oversized admin uploads."""
-    if not upload:
-        return upload
-    extension = Path(upload.name).suffix.lower()
-    if extension not in allowed_extensions:
-        raise ValidationError("This file type is not allowed.")
-    if upload.size == 0 or upload.size > settings.VIDEO_MAX_UPLOAD_BYTES:
-        raise ValidationError("This file has an invalid size.")
-    return upload
+from videos.validators import (
+    validate_plain_text,
+    validate_thumbnail_upload,
+    validate_video_upload,
+)
 
 
 class VideoAdminForm(forms.ModelForm):
@@ -36,15 +22,23 @@ class VideoAdminForm(forms.ModelForm):
 
     def clean_video_file(self):
         """Allow supported video extensions within the configured size cap."""
-        return validate_upload(
-            self.cleaned_data["video_file"], VIDEO_EXTENSIONS
-        )
+        return validate_video_upload(self.cleaned_data["video_file"])
 
     def clean_thumbnail(self):
         """Allow common web image extensions for optional thumbnails."""
-        return validate_upload(
-            self.cleaned_data.get("thumbnail"), THUMBNAIL_EXTENSIONS
-        )
+        return validate_thumbnail_upload(self.cleaned_data.get("thumbnail"))
+
+    def clean_title(self):
+        """Reject HTML markup from video titles rendered by the frontend."""
+        return validate_plain_text(self.cleaned_data["title"])
+
+    def clean_description(self):
+        """Reject HTML markup from descriptions rendered by the frontend."""
+        return validate_plain_text(self.cleaned_data["description"])
+
+    def clean_category(self):
+        """Reject HTML markup from category labels."""
+        return validate_plain_text(self.cleaned_data["category"])
 
 
 @admin.register(Video)

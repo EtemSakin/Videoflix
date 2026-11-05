@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.test import (
@@ -26,6 +27,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 from videos.admin import VideoAdmin, VideoAdminForm
 from videos.cache import VIDEO_CATALOG_CACHE_KEY
 from videos.models import Video
+from videos.validators import validate_file_name
 
 User = get_user_model()
 VIDEO_RESPONSE_FIELDS = {
@@ -36,6 +38,36 @@ VIDEO_RESPONSE_FIELDS = {
     "thumbnail_url",
     "category",
 }
+ESCAPED_METADATA = {
+    "title": "&lt;script&gt;alert(1)&lt;/script&gt;",
+    "description": "&lt;img src=x&gt;",
+    "category": "&lt;b&gt;Drama&lt;/b&gt;",
+}
+
+
+def admin_form_data():
+    """Return valid metadata for admin form tests."""
+    return {
+        "title": "Admin film",
+        "description": "Description",
+        "category": "Drama",
+        "status": Video.STATUS_PENDING,
+    }
+
+
+def admin_uploads(filename, thumbnail, content):
+    """Build source and optional WebP uploads for admin form tests."""
+    files = {"video_file": SimpleUploadedFile(filename, content)}
+    if thumbnail:
+        files["thumbnail"] = SimpleUploadedFile(
+            thumbnail, b"RIFF\x00\x00\x00\x00WEBP"
+        )
+    return files
+
+
+def catalog_metadata(item):
+    """Select escaped text values from a catalog response item."""
+    return {field: item[field] for field in ESCAPED_METADATA}
 
 
 class VideoModelTests(TestCase):
@@ -87,19 +119,16 @@ class VideoModelTests(TestCase):
 class VideoAdminTests(TestCase):
     """Verify video admin integration and upload validation."""
 
-    def admin_form(self, filename, thumbnail=None, content=b"sample"):
+    def admin_form(
+        self,
+        filename,
+        thumbnail=None,
+        content=b"\x00\x00\x00\x18ftypisom",
+    ):
         """Build a valid admin form with supplied media uploads."""
-        files = {"video_file": SimpleUploadedFile(filename, content)}
-        if thumbnail:
-            files["thumbnail"] = SimpleUploadedFile(thumbnail, b"image")
         return VideoAdminForm(
-            data={
-                "title": "Admin film",
-                "description": "Description",
-                "category": "Drama",
-                "status": Video.STATUS_PENDING,
-            },
-            files=files,
+            data=admin_form_data(),
+            files=admin_uploads(filename, thumbnail, content),
         )
 
     def test_video_admin_is_registered_with_practical_catalog_columns(self):
@@ -144,6 +173,32 @@ class VideoAdminTests(TestCase):
         form = self.admin_form("sample.mp4", content=b"larger")
         self.assertFalse(form.is_valid())
         self.assertIn("video_file", form.errors)
+
+    def test_admin_form_rejects_content_with_a_mismatched_signature(self):
+        """Reject renamed files whose content does not match the extension."""
+        form = self.admin_form("payload.mp4", content=b"not a video")
+        self.assertFalse(form.is_valid())
+        self.assertIn("video_file", form.errors)
+
+    def test_admin_form_rejects_empty_uploads(self):
+        """Reject zero-byte source uploads."""
+        form = self.admin_form("empty.mp4", content=b"")
+        self.assertFalse(form.is_valid())
+        self.assertIn("video_file", form.errors)
+
+    def test_admin_form_rejects_markup_in_video_metadata(self):
+        """Reject markup in fields shown as HTML by the frontend."""
+        form = self.admin_form("sample.mp4")
+        form.data = {**form.data, "title": "<script>alert(1)</script>"}
+        self.assertFalse(form.is_valid())
+        self.assertIn("title", form.errors)
+
+    def test_filename_validator_rejects_path_traversal(self):
+        """Reject path separators and null bytes in upload names."""
+        for filename in ("../film.mp4", "folder/film.mp4", "bad\x00.mp4"):
+            with self.subTest(filename=filename):
+                with self.assertRaises(ValidationError):
+                    validate_file_name(filename)
 
 
 class PrivateMediaStorageTests(SimpleTestCase):
@@ -226,6 +281,18 @@ class VideoListAPITests(APITestCase):
         response = self.client.get(reverse("video_list"))
         self.assert_catalog_response(response, [newer.pk, older.pk])
         self.assertIsNone(response.data[0]["thumbnail_url"])
+
+    def test_catalog_escapes_metadata_before_frontend_html_insertion(self):
+        """Escape stored markup even when data bypassed the admin form."""
+        video = self.create_video(
+            "<script>alert(1)</script>",
+            Video.STATUS_READY,
+            description="<img src=x>",
+            category="<b>Drama</b>",
+        )
+        response = self.client.get(reverse("video_list"))
+        self.assertEqual(response.data[0]["id"], video.pk)
+        self.assertEqual(catalog_metadata(response.data[0]), ESCAPED_METADATA)
 
     def test_missing_thumbnail_file_returns_404_without_breaking_catalog(self):
         """Keep missing disk assets from causing server errors."""
