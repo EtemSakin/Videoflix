@@ -55,10 +55,10 @@ class VideoAdmin(admin.ModelAdmin):
     ordering = ("-created_at", "id")
 
     def save_model(self, request, obj, form, change):
-        """Queue processing after a newly uploaded video is committed."""
-        is_new = obj._state.adding
+        """Queue pending video processing after the database commit."""
+        should_queue = obj._state.adding or obj.status == Video.STATUS_PENDING
         super().save_model(request, obj, form, change)
-        if is_new:
+        if should_queue:
             transaction.on_commit(
                 lambda: enqueue_video_processing(obj.pk)
             )

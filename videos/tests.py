@@ -1,7 +1,10 @@
 """Tests for the video catalog model."""
 
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -12,11 +15,12 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db import connection
+from django.db import close_old_connections, connection
 from django.test import (
     RequestFactory,
     SimpleTestCase,
     TestCase,
+    TransactionTestCase,
     override_settings,
 )
 from django.test.utils import CaptureQueriesContext
@@ -108,6 +112,69 @@ def fake_ffmpeg_success(command, **options):
     (segment_pattern.parent / "segment_00000.ts").write_bytes(b"segment")
     Path(command[-1]).write_text("#EXTM3U\nsegment_00000.ts\n")
     return subprocess.CompletedProcess(command, 0)
+
+
+def mock_hls_output(_source, root, resolution):
+    """Return the expected profile path in mocked worker tests."""
+    return root / resolution
+
+
+def process_video_in_thread(video_id):
+    """Use an independent database connection for each worker thread."""
+    close_old_connections()
+    try:
+        return process_video(video_id)
+    finally:
+        close_old_connections()
+
+
+def block_first_conversion(
+    started, release, calls, lock, _source, root, resolution
+):
+    """Hold the first worker inside conversion while a duplicate starts."""
+    with lock:
+        is_first = not calls
+        calls.append(resolution)
+    if is_first:
+        started.set()
+        release.wait(timeout=10)
+    return root / resolution
+
+
+def wait_for_first_worker(started, release):
+    """Require the initial worker to enter conversion before the duplicate."""
+    if not started.wait(timeout=10):
+        release.set()
+        raise TimeoutError("The first worker did not start conversion.")
+
+
+def run_duplicate_video_jobs(
+    video_id, converter, started, release
+):
+    """Run two independent jobs while the first one owns the claim."""
+    with patch("videos.tasks.transcode_hls_rendition", side_effect=converter):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(process_video_in_thread, video_id)
+            wait_for_first_worker(started, release)
+            second = executor.submit(process_video_in_thread, video_id)
+            duplicate = second.result(timeout=10)
+            release.set()
+            completed = first.result(timeout=10)
+    return completed, duplicate
+
+
+def run_concurrent_conversion(video_id):
+    """Run two duplicate workers with the first held during conversion."""
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    converter = partial(
+        block_first_conversion, started, release, calls, threading.Lock()
+    )
+    completed, duplicate = run_duplicate_video_jobs(
+        video_id, converter, started, release
+    )
+    return completed, duplicate, calls
 
 
 class HLSCommandBuilderTests(SimpleTestCase):
@@ -232,6 +299,83 @@ class VideoQueueTests(TestCase):
             outputs = process_video(video.pk)
         self.assertEqual(len(outputs), 3)
         self.assertEqual(transcode.call_count, 3)
+
+
+class VideoProcessingStatusTests(TestCase):
+    """Verify worker jobs persist valid video processing transitions."""
+
+    def create_pending_video(self):
+        """Create a row that is eligible for one conversion job."""
+        return Video.objects.create(
+            title="Pending film",
+            category="Drama",
+            video_file="videos/source/pending.mp4",
+        )
+
+    def test_successful_processing_marks_video_ready(self):
+        """Mark ready only after all HLS profiles return successfully."""
+        video = self.create_pending_video()
+        with patch("videos.tasks.transcode_hls_rendition") as transcode:
+            transcode.side_effect = lambda _source, root, size: root / size
+            outputs = process_video(video.pk)
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_READY)
+        self.assertEqual(len(outputs), 3)
+
+    def test_status_transitions_schedule_catalog_cache_invalidation(self):
+        """Invalidate cached listings when processing status is saved."""
+        video = self.create_pending_video()
+        with patch("videos.signals.invalidate_video_catalog_cache") as clear:
+            with patch(
+                "videos.tasks.transaction.on_commit",
+                side_effect=lambda callback: callback(),
+            ):
+                with patch(
+                    "videos.tasks.transcode_hls_rendition",
+                    side_effect=mock_hls_output,
+                ):
+                    process_video(video.pk)
+        self.assertEqual(clear.call_count, 2)
+
+    def test_conversion_failure_marks_video_failed(self):
+        """Persist failure before returning the worker exception to RQ."""
+        video = self.create_pending_video()
+        with patch(
+            "videos.tasks.transcode_hls_rendition",
+            side_effect=HLSConversionError,
+        ):
+            with self.assertRaises(HLSConversionError):
+                process_video(video.pk)
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_FAILED)
+
+    def test_duplicate_processing_job_skips_non_pending_video(self):
+        """Avoid rerunning a job already claimed by another worker."""
+        video = self.create_pending_video()
+        Video.objects.filter(pk=video.pk).update(
+            status=Video.STATUS_PROCESSING
+        )
+        with patch("videos.tasks.transcode_hls_rendition") as transcode:
+            self.assertEqual(process_video(video.pk), [])
+        transcode.assert_not_called()
+
+
+class VideoProcessingConcurrencyTests(TransactionTestCase):
+    """Verify concurrent PostgreSQL workers cannot double-claim a video."""
+
+    def test_duplicate_jobs_transcode_only_once_across_connections(self):
+        """Lock the pending row while a second worker attempts to claim it."""
+        video = Video.objects.create(
+            title="Concurrent film",
+            category="Drama",
+            video_file="videos/source/concurrent.mp4",
+        )
+        completed, duplicate, calls = run_concurrent_conversion(video.pk)
+        video.refresh_from_db()
+        self.assertEqual(len(completed), 3)
+        self.assertEqual(duplicate, [])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(video.status, Video.STATUS_READY)
 
 
 class VideoModelTests(TestCase):

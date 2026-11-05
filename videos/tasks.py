@@ -4,6 +4,7 @@ import logging
 
 import django_rq
 from django.conf import settings
+from django.db import transaction
 from redis.exceptions import RedisError
 
 from videos.models import Video
@@ -35,14 +36,60 @@ def log_queued_job(video_id, job_id):
 
 
 def process_video(video_id):
-    """Generate every supported HLS rendition for one saved video."""
-    video = Video.objects.get(pk=video_id)
-    output_root = settings.VIDEO_HLS_ROOT / str(video.pk)
+    """Claim a pending video, transcode it, and persist its final state."""
+    claimed = claim_video_processing(video_id)
+    if claimed is None:
+        return []
+    source, output_root = claimed
+    try:
+        outputs = convert_video(source, output_root)
+    except Exception:
+        mark_processing_failed(video_id)
+        raise
+    if not mark_processing_ready(video_id):
+        raise RuntimeError("Video processing state changed unexpectedly.")
+    return outputs
+
+
+def claim_video_processing(video_id):
+    """Atomically claim pending work so duplicate RQ jobs cannot transcode."""
+    with transaction.atomic():
+        video = Video.objects.select_for_update().get(pk=video_id)
+        if video.status != Video.STATUS_PENDING:
+            return None
+        video.status = Video.STATUS_PROCESSING
+        video.save(update_fields=("status",))
+    return video.video_file.path, settings.VIDEO_HLS_ROOT / str(video.pk)
+
+
+def convert_video(source, output_root):
+    """Generate all configured HLS profiles for a claimed video."""
     return [
-        str(
-            transcode_hls_rendition(
-                video.video_file.path, output_root, resolution
-            )
-        )
+        str(transcode_hls_rendition(source, output_root, resolution))
         for resolution in HLS_PROFILES
     ]
+
+
+def update_video_status(video_id, expected_status, new_status):
+    """Apply a lifecycle transition only while the expected state remains."""
+    with transaction.atomic():
+        video = Video.objects.select_for_update().filter(
+            pk=video_id, status=expected_status
+        ).first()
+        if video is None:
+            return False
+        video.status = new_status
+        video.save(update_fields=("status",))
+    return True
+
+
+def mark_processing_failed(video_id):
+    """Mark active work as failed after conversion raises an error."""
+    update_video_status(video_id, Video.STATUS_PROCESSING, Video.STATUS_FAILED)
+
+
+def mark_processing_ready(video_id):
+    """Mark active work ready only if its processing claim is still current."""
+    return update_video_status(
+        video_id, Video.STATUS_PROCESSING, Video.STATUS_READY
+    )
