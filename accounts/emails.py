@@ -28,26 +28,37 @@ def build_activation_url(user):
 def build_activation_message(user, activation_url):
     """Render multipart activation content for the recipient."""
     text_body, html_body = render_activation_bodies(activation_url)
-    message = EmailMultiAlternatives(
-        "Activate your Videoflix account",
-        text_body,
-        settings.DEFAULT_FROM_EMAIL,
-        [user.email],
+    return build_multipart_message(
+        "Activate your Videoflix account", user.email, text_body, html_body
     )
-    message.attach_alternative(html_body, "text/html")
-    return message
 
 
 def render_activation_bodies(activation_url):
     """Render separate plaintext and autoescaped HTML email bodies."""
-    text_context = {"activation_url": mark_safe(activation_url)}
+    return render_multipart_bodies(
+        activation_url,
+        "activation_url",
+        "accounts/activation_email.txt",
+        "accounts/activation_email.html",
+    )
+
+
+def render_multipart_bodies(url, context_key, text_template, html_template):
+    """Render plaintext URLs literally and escape them in HTML bodies."""
     text_body = render_to_string(
-        "accounts/activation_email.txt", text_context
+        text_template, {context_key: mark_safe(url)}
     )
-    html_body = render_to_string(
-        "accounts/activation_email.html", {"activation_url": activation_url}
-    )
+    html_body = render_to_string(html_template, {context_key: url})
     return text_body, html_body
+
+
+def build_multipart_message(subject, recipient, text_body, html_body):
+    """Create one configured multipart email for a recipient."""
+    message = EmailMultiAlternatives(
+        subject, text_body, settings.DEFAULT_FROM_EMAIL, [recipient]
+    )
+    message.attach_alternative(html_body, "text/html")
+    return message
 
 
 def send_activation_email(user):
@@ -77,26 +88,19 @@ def build_password_reset_url(user):
 def build_password_reset_message(user, reset_url):
     """Render a multipart password-reset email for one recipient."""
     text_body, html_body = render_password_reset_bodies(reset_url)
-    message = EmailMultiAlternatives(
-        "Reset your Videoflix password",
-        text_body,
-        settings.DEFAULT_FROM_EMAIL,
-        [user.email],
+    return build_multipart_message(
+        "Reset your Videoflix password", user.email, text_body, html_body
     )
-    message.attach_alternative(html_body, "text/html")
-    return message
 
 
 def render_password_reset_bodies(reset_url):
     """Render plaintext and autoescaped HTML password-reset bodies."""
-    text_context = {"reset_url": mark_safe(reset_url)}
-    text_body = render_to_string(
-        "accounts/password_reset_email.txt", text_context
+    return render_multipart_bodies(
+        reset_url,
+        "reset_url",
+        "accounts/password_reset_email.txt",
+        "accounts/password_reset_email.html",
     )
-    html_body = render_to_string(
-        "accounts/password_reset_email.html", {"reset_url": reset_url}
-    )
-    return text_body, html_body
 
 
 def send_password_reset_email(user):
