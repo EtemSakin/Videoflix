@@ -30,6 +30,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 from videos.admin import VideoAdmin, VideoAdminForm
 from videos.cache import VIDEO_CATALOG_CACHE_KEY
 from videos.models import Video
+from videos.tasks import enqueue_video_processing, process_video
 from videos.transcoding import (
     HLS_PROFILES,
     FFmpegUnavailableError,
@@ -65,6 +66,18 @@ def admin_form_data():
         "category": "Drama",
         "status": Video.STATUS_PENDING,
     }
+
+
+def new_admin_video():
+    """Build a saved admin video fixture with a small source upload."""
+    return Video(
+        title="Queued film",
+        description="Description",
+        category="Drama",
+        video_file=SimpleUploadedFile(
+            "source.mp4", b"\x00\x00\x00\x18ftypisom"
+        ),
+    )
 
 
 def admin_uploads(filename, thumbnail, content):
@@ -166,6 +179,59 @@ class HLSCommandBuilderTests(SimpleTestCase):
                 with self.assertRaises(HLSConversionError):
                     transcode_hls_rendition(source, root / "hls", "480p")
             self.assertFalse((root / "hls" / "480p").exists())
+
+
+class VideoQueueTests(TestCase):
+    """Verify admin-triggered work is deferred to the RQ worker."""
+
+    def test_admin_enqueues_new_video_only_after_database_commit(self):
+        """Register queue submission as an on-commit callback."""
+        with TemporaryDirectory() as temporary:
+            with override_settings(MEDIA_ROOT=Path(temporary)):
+                self.assert_admin_enqueue_deferred()
+
+    def assert_admin_enqueue_deferred(self):
+        """Persist a new upload and verify its deferred worker job."""
+        video = new_admin_video()
+        callbacks = []
+        with patch("videos.admin.transaction.on_commit", callbacks.append):
+            with patch("videos.tasks.django_rq.get_queue") as get_queue:
+                admin.site._registry[Video].save_model(
+                    None, video, None, False
+                )
+                get_queue.assert_not_called()
+                for callback in callbacks:
+                    callback()
+                self.assert_job_enqueued(get_queue, video.pk)
+
+    def assert_job_enqueued(self, queue_mock, video_id):
+        """Check the RQ task uses an ID and the selected long timeout."""
+        queue_mock.return_value.enqueue.assert_called_once_with(
+            "videos.tasks.process_video", video_id, job_timeout=3600
+        )
+
+    def test_queue_unavailability_is_reported_without_raising(self):
+        """Handle Redis enqueue errors without breaking admin uploads."""
+        with self.assertLogs("videos.tasks", level="ERROR"):
+            with patch(
+                "videos.tasks.django_rq.get_queue", side_effect=RedisError
+            ):
+                self.assertIsNone(enqueue_video_processing(27))
+
+    def test_processing_task_enqueues_each_supported_rendition(self):
+        """Process one row through every configured HLS profile."""
+        video = Video.objects.create(
+            title="Worker film",
+            category="Drama",
+            video_file="videos/source/worker.mp4",
+        )
+        with patch("videos.tasks.transcode_hls_rendition") as transcode:
+            transcode.side_effect = (
+                lambda _source, root, resolution: root / resolution
+            )
+            outputs = process_video(video.pk)
+        self.assertEqual(len(outputs), 3)
+        self.assertEqual(transcode.call_count, 3)
 
 
 class VideoModelTests(TestCase):

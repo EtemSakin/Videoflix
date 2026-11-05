@@ -2,8 +2,10 @@
 
 from django import forms
 from django.contrib import admin
+from django.db import transaction
 
 from videos.models import Video
+from videos.tasks import enqueue_video_processing
 from videos.validators import (
     validate_plain_text,
     validate_thumbnail_upload,
@@ -51,3 +53,12 @@ class VideoAdmin(admin.ModelAdmin):
     search_fields = ("title", "description", "category")
     readonly_fields = ("created_at",)
     ordering = ("-created_at", "id")
+
+    def save_model(self, request, obj, form, change):
+        """Queue processing after a newly uploaded video is committed."""
+        is_new = obj._state.adding
+        super().save_model(request, obj, form, change)
+        if is_new:
+            transaction.on_commit(
+                lambda: enqueue_video_processing(obj.pk)
+            )
