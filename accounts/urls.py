@@ -6,6 +6,7 @@ from accounts.views import (
     AccountActivationAPIView,
     LoginAPIView,
     LogoutAPIView,
+    PasswordResetConfirmAPIView,
     PasswordResetRequestAPIView,
     RegistrationAPIView,
     TokenRefreshAPIView,
@@ -19,6 +20,11 @@ urlpatterns = [
         "password_reset/",
         PasswordResetRequestAPIView.as_view(),
         name="password_reset",
+    ),
+    path(
+        "password_confirm/<str:uidb64>/<str:token>/",
+        PasswordResetConfirmAPIView.as_view(),
+        name="password_confirm",
     ),
     path(
         "token/refresh/",

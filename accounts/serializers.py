@@ -124,3 +124,41 @@ class PasswordResetRequestSerializer(serializers.Serializer):
     def validate_email(self, value):
         """Normalize email casing before the user lookup."""
         return value.strip().lower()
+
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    """Validate and confirm a replacement account password."""
+
+    new_password = serializers.CharField(
+        write_only=True, trim_whitespace=False
+    )
+    confirm_password = serializers.CharField(
+        write_only=True, trim_whitespace=False
+    )
+
+    def to_internal_value(self, data):
+        """Reject fields outside the official confirmation request."""
+        if hasattr(data, "keys") and set(data.keys()) - set(self.fields):
+            raise serializers.ValidationError(
+                {"detail": "Unexpected fields are not allowed."}
+            )
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        """Check the confirmation and apply Django's password validators."""
+        if attrs["new_password"] != attrs["confirm_password"]:
+            raise serializers.ValidationError({
+                "confirm_password": "Passwords do not match."
+            })
+        self.validate_django_password(attrs["new_password"])
+        return attrs
+
+    def validate_django_password(self, password):
+        """Validate against the account associated with the reset token."""
+        user = self.context["user"]
+        try:
+            password_validation.validate_password(password, user=user)
+        except DjangoValidationError as error:
+            raise serializers.ValidationError(
+                {"new_password": error.messages}
+            ) from error

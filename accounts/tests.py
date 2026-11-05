@@ -38,8 +38,10 @@ from accounts.authentication import CookieJWTAuthentication
 from accounts.emails import (
     EmailDeliveryError,
     build_activation_url,
+    build_password_reset_url,
 )
 from accounts.serializers import (
+    PasswordResetConfirmSerializer,
     RegistrationSerializer,
 )
 
@@ -992,6 +994,198 @@ class PasswordResetRequestTests(APITestCase):
         self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
 
 
+class PasswordResetConfirmTests(APITestCase):
+    """Verify one-time password reset links and password validation."""
+
+    def setUp(self):
+        """Create an active account and its password-reset confirmation URL."""
+        self.old_password = "StrongPass!73"
+        self.new_password = "DifferentPass!84"
+        self.user = User.objects.create_user(
+            "reset-confirm@example.com", self.old_password
+        )
+        self.uid = encode_user_id(self.user)
+        self.token = default_token_generator.make_token(self.user)
+        self.url = reverse(
+            "password_confirm",
+            kwargs={"uidb64": self.uid, "token": self.token},
+        )
+        self.client.defaults["HTTP_ORIGIN"] = "http://127.0.0.1:5500"
+
+    def submit_confirmation(self, payload=None, url=None):
+        """Post confirmation data to the current or supplied reset route."""
+        data = payload or self.password_payload()
+        return self.client.post(url or self.url, data, format="json")
+
+    def password_payload(self, password=None, confirmation=None):
+        """Return the official new-password request field names."""
+        new_password = password or self.new_password
+        confirmed = confirmation or new_password
+        return {
+            "new_password": new_password,
+            "confirm_password": confirmed,
+        }
+
+    def test_valid_reset_changes_password_and_returns_exact_response(self):
+        """Set the hashed password and return the documented success body."""
+        response = self.submit_confirmation()
+        self.user.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data,
+            {"detail": "Your Password has been successfully reset."},
+        )
+        self.assertTrue(self.user.check_password(self.new_password))
+        self.assertFalse(self.user.check_password(self.old_password))
+
+    def test_password_reset_email_link_works_with_confirmation_endpoint(self):
+        """Use the same uid and token values produced by reset email links."""
+        reset_url = build_password_reset_url(self.user)
+        params = parse_qs(urlparse(reset_url).query)
+        url = reverse(
+            "password_confirm",
+            kwargs={"uidb64": params["uid"][0], "token": params["token"][0]},
+        )
+        response = self.submit_confirmation(url=url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_reset_password_fields_are_write_only(self):
+        """Never serialize either new password field in an API response."""
+        serializer = PasswordResetConfirmSerializer(
+            context={"user": self.user}
+        )
+        self.assertTrue(serializer.fields["new_password"].write_only)
+        self.assertTrue(serializer.fields["confirm_password"].write_only)
+
+    def test_invalid_uid_returns_generic_bad_request(self):
+        """Reject malformed or unknown base64 user identifiers."""
+        url = f"/api/password_confirm/bad/{self.token}/"
+        response = self.submit_confirmation(url=url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data, {"detail": "Invalid or expired reset link."}
+        )
+
+    def test_invalid_token_returns_generic_bad_request(self):
+        """Reject token values that do not match the account state."""
+        url = reverse(
+            "password_confirm",
+            kwargs={"uidb64": self.uid, "token": "invalid-token"},
+        )
+        response = self.submit_confirmation(url=url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_expired_token_returns_generic_bad_request(self):
+        """Reject password-reset tokens outside Django's timeout."""
+        with override_settings(PASSWORD_RESET_TIMEOUT=-1):
+            response = self.submit_confirmation()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reused_token_is_rejected(self):
+        """Reject a reset link after its password change invalidates it."""
+        first = self.submit_confirmation()
+        second = self.submit_confirmation()
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_mismatched_passwords_are_rejected(self):
+        """Keep the existing password when confirmation does not match."""
+        payload = self.password_payload(confirmation="OtherPass!95")
+        response = self.submit_confirmation(payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(self.user.check_password(self.old_password))
+
+    def test_django_password_validators_reject_weak_or_similar_values(self):
+        """Reject short, common, numeric, and email-similar passwords."""
+        invalid = (
+            "short",
+            "password",
+            "12345678",
+            "reset-confirm@example.com",
+        )
+        for password in invalid:
+            with self.subTest(password=password):
+                self.assert_invalid_password(password)
+
+    def assert_invalid_password(self, password):
+        """Require weak or email-similar values to return HTTP 400."""
+        response = self.submit_confirmation(self.password_payload(password))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_missing_fields_and_unknown_fields_are_rejected(self):
+        """Require both documented passwords and reject extra fields."""
+        missing = self.submit_confirmation({"new_password": self.new_password})
+        extra = self.submit_confirmation(
+            {**self.password_payload(), "extra": "value"}
+        )
+        self.assertEqual(missing.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(extra.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_inactive_account_cannot_use_reset_link(self):
+        """Reject links after an account has been disabled."""
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+        response = self.submit_confirmation()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class ConcurrentPasswordResetTests(TransactionTestCase):
+    """Verify a reset token succeeds once under concurrent requests."""
+
+    def setUp(self):
+        """Create the account, reset link, and matching password payload."""
+        self.user = User.objects.create_user(
+            "parallel-reset@example.com", "StrongPass!73"
+        )
+        uid = encode_user_id(self.user)
+        token = default_token_generator.make_token(self.user)
+        self.url = reverse(
+            "password_confirm", kwargs={"uidb64": uid, "token": token}
+        )
+        self.payload = {
+            "new_password": "DifferentPass!84",
+            "confirm_password": "DifferentPass!84",
+        }
+
+    @staticmethod
+    def reset_after_barrier(url, payload, barrier):
+        """Submit on a new synchronized PostgreSQL connection."""
+        close_old_connections()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                backend_pid = cursor.fetchone()[0]
+            barrier.wait(timeout=10)
+            response = submit_password_confirmation(url, payload)
+            return response.status_code, backend_pid
+        finally:
+            connections.close_all()
+
+    def run_parallel_resets(self):
+        """Run two simultaneous requests using the same one-time link."""
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            return list(
+                executor.map(
+                    lambda _: self.reset_after_barrier(
+                        self.url, self.payload, barrier
+                    ),
+                    range(2),
+                )
+            )
+
+    def test_only_one_parallel_password_reset_succeeds(self):
+        """Allow only one request to change the account password."""
+        results = self.run_parallel_resets()
+        statuses, backend_pids = zip(*results)
+        self.assertCountEqual(statuses, [200, 400])
+        self.assertEqual(len(set(backend_pids)), 2)
+        self.assertTrue(
+            User.objects.get(email="parallel-reset@example.com").check_password(
+                self.payload["new_password"]
+            )
+        )
+
+
 class ConcurrentTokenRefreshTests(TransactionTestCase):
     """Verify concurrent requests cannot rotate a token more than once."""
 
@@ -1062,3 +1256,14 @@ def extract_reset_url(body):
 def encode_user_id(user):
     """Encode a user ID in Django's URL-safe activation format."""
     return urlsafe_base64_encode(force_bytes(user.pk))
+
+
+def submit_password_confirmation(url, payload):
+    """Send one browser-compatible password reset confirmation request."""
+    client = APIClient()
+    return client.post(
+        url,
+        payload,
+        format="json",
+        HTTP_ORIGIN="http://127.0.0.1:5500",
+    )

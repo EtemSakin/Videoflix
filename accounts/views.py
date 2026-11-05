@@ -33,6 +33,7 @@ from accounts.emails import (
 from accounts.serializers import (
     LOGIN_ERROR,
     LoginSerializer,
+    PasswordResetConfirmSerializer,
     PasswordResetRequestSerializer,
     RegistrationSerializer,
 )
@@ -136,6 +137,28 @@ class PasswordResetRequestAPIView(APIView):
         request_password_reset(serializer.validated_data["email"])
         return Response(
             {"detail": "An email has been sent to reset your password."},
+            status=status.HTTP_200_OK,
+        )
+
+
+class PasswordResetConfirmAPIView(APIView):
+    """Confirm a reset link and replace the account password once."""
+
+    authentication_classes = ()
+    permission_classes = (AllowAny,)
+
+    def post(self, request, uidb64, token):
+        """Validate the one-time link and set the new password."""
+        uid = decode_activation_uid(uidb64)
+        if uid is None:
+            return invalid_password_reset_response()
+        completed, errors = process_password_reset(uid, token, request.data)
+        if errors:
+            return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+        if not completed:
+            return invalid_password_reset_response()
+        return Response(
+            {"detail": "Your Password has been successfully reset."},
             status=status.HTTP_200_OK,
         )
 
@@ -332,6 +355,48 @@ def request_password_reset(email):
         send_password_reset_email(user)
     except EmailDeliveryError:
         logger.error("Password reset email delivery failed.")
+
+
+def process_password_reset(uid, token, data):
+    """Convert invalid reset users and tokens into a controlled failure."""
+    try:
+        return apply_password_reset(uid, token, data)
+    except (User.DoesNotExist, TypeError, ValueError, OverflowError):
+        return None, None
+
+
+def apply_password_reset(uid, token, data):
+    """Lock the account, validate the token, and change its password."""
+    with transaction.atomic():
+        user = User.objects.select_for_update().get(pk=uid)
+        if not user.is_active or not default_token_generator.check_token(
+            user, token
+        ):
+            return None, None
+        errors = validate_and_set_password(user, data)
+        if errors:
+            return None, errors
+    return True, None
+
+
+def validate_and_set_password(user, data):
+    """Validate the new password and save only its Django hash."""
+    serializer = PasswordResetConfirmSerializer(
+        data=data, context={"user": user}
+    )
+    if not serializer.is_valid():
+        return serializer.errors
+    user.set_password(serializer.validated_data["new_password"])
+    user.save(update_fields=("password",))
+    return None
+
+
+def invalid_password_reset_response():
+    """Return a generic response for invalid or expired reset links."""
+    return Response(
+        {"detail": "Invalid or expired reset link."},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
 
 
 def create_registered_user(serializer):
