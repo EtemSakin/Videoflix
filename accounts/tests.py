@@ -26,14 +26,28 @@ from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from rest_framework import status
-from rest_framework.test import APIClient, APITestCase
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.test import APIClient, APIRequestFactory, APITestCase
+from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 
 from accounts.admin import EmailUserCreationForm
+from accounts.authentication import CookieJWTAuthentication
 from accounts.emails import build_activation_url
 from accounts.serializers import RegistrationSerializer
 
 User = get_user_model()
+
+
+class ProtectedCookieAPIView(APIView):
+    """Provide an isolated protected view for authentication tests."""
+
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request):
+        """Return the authenticated user ID for test assertions."""
+        return Response({"user_id": request.user.pk})
 
 
 class UserManagerTests(TestCase):
@@ -241,7 +255,10 @@ class RegistrationEndpointTests(APITestCase):
 
     def test_three_fields_register_an_inactive_user_without_auth(self):
         """Register anonymously with documented fields and hash password."""
-        response = self.submit_registration()
+        cookie = f"{settings.JWT_ACCESS_COOKIE_NAME}=invalid"
+        response = self.client.post(
+            self.url, self.payload, format="json", HTTP_COOKIE=cookie
+        )
         user = User.objects.get(email="filmfan@example.com")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertFalse(user.is_active)
@@ -376,7 +393,8 @@ class AccountActivationTests(APITestCase):
 
     def test_anonymous_activation_succeeds_with_exact_response(self):
         """Allow anonymous activation and return the official success body."""
-        response = self.client.get(self.url)
+        cookie = f"{settings.JWT_ACCESS_COOKIE_NAME}=invalid"
+        response = self.client.get(self.url, HTTP_COOKIE=cookie)
         self.user.refresh_from_db()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
@@ -586,3 +604,97 @@ class LoginEndpointTests(APITestCase):
         payload = {**self.credentials, "username": "ignored"}
         response = self.submit_login(payload)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_public_login_ignores_invalid_access_cookie(self):
+        """Allow login when a stale browser cookie is present."""
+        response = self.client.post(
+            self.url,
+            self.credentials,
+            format="json",
+            HTTP_COOKIE=f"{settings.JWT_ACCESS_COOKIE_NAME}=invalid",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class CookieJWTAuthenticationTests(APITestCase):
+    """Test cookie authentication against a protected DRF view."""
+
+    def setUp(self):
+        """Create a user, API request factory, and protected test view."""
+        self.user = User.objects.create_user(
+            "cookie-auth@example.com", "StrongPass!73"
+        )
+        self.factory = APIRequestFactory()
+        self.view = ProtectedCookieAPIView.as_view()
+        token = RefreshToken.for_user(self.user).access_token
+        self.access_token = str(token)
+
+    def request_with_cookie(self, value=None, authorization=None):
+        """Call the protected view with optional cookie or header input."""
+        headers = {}
+        if value is not None:
+            cookie = settings.JWT_ACCESS_COOKIE_NAME
+            headers["HTTP_COOKIE"] = f"{cookie}={value}"
+        if authorization is not None:
+            headers["HTTP_AUTHORIZATION"] = authorization
+        request = self.factory.get("/protected/", **headers)
+        return self.view(request)
+
+    def test_cookie_authentication_is_configured_by_default(self):
+        """Use cookie JWTs as the global DRF authentication class."""
+        self.assertEqual(
+            ProtectedCookieAPIView.authentication_classes,
+            [CookieJWTAuthentication],
+        )
+
+    def test_valid_access_cookie_authenticates_user(self):
+        """Resolve the cookie's signed subject to the active database user."""
+        response = self.request_with_cookie(self.access_token)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {"user_id": self.user.pk})
+
+    def test_missing_cookie_is_unauthorized(self):
+        """Reject protected requests without an access-token cookie."""
+        response = self.request_with_cookie()
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_invalid_cookie_is_unauthorized(self):
+        """Reject forged token values without authenticating the request."""
+        response = self.request_with_cookie("forged.token.value")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_refresh_token_is_not_accepted_as_access_cookie(self):
+        """Reject refresh tokens presented in the access-cookie slot."""
+        refresh = str(RefreshToken.for_user(self.user))
+        response = self.request_with_cookie(refresh)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_bearer_header_alone_is_not_authenticated(self):
+        """Require a cookie instead of accepting a stray header token."""
+        response = self.request_with_cookie(
+            authorization=f"Bearer {self.access_token}"
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_expired_cookie_is_unauthorized(self):
+        """Reject access tokens past their expiration timestamp."""
+        token = RefreshToken.for_user(self.user).access_token
+        token.set_exp(lifetime=timedelta(seconds=-1))
+        response = self.request_with_cookie(str(token))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_inactive_user_is_unauthorized(self):
+        """Reject validly signed tokens belonging to inactive users."""
+        user = User.objects.create_user(
+            "inactive-cookie@example.com", "StrongPass!73"
+        )
+        token = str(RefreshToken.for_user(user).access_token)
+        User.objects.filter(pk=user.pk).update(is_active=False)
+        response = self.request_with_cookie(token)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_deleted_user_is_unauthorized(self):
+        """Reject valid tokens after their user account has been removed."""
+        User.objects.filter(pk=self.user.pk).delete()
+        response = self.request_with_cookie(self.access_token)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)

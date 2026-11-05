@@ -33,6 +33,7 @@ User = get_user_model()
 class RegistrationAPIView(APIView):
     """Register an inactive user and send an activation email."""
 
+    authentication_classes = ()
     permission_classes = (AllowAny,)
 
     def post(self, request):
@@ -52,6 +53,7 @@ class RegistrationAPIView(APIView):
 class LoginAPIView(APIView):
     """Authenticate users and issue HttpOnly JWT cookies."""
 
+    authentication_classes = ()
     permission_classes = (AllowAny,)
 
     def post(self, request):
@@ -69,6 +71,7 @@ class LoginAPIView(APIView):
 class AccountActivationAPIView(APIView):
     """Activate an inactive account through its emailed one-time link."""
 
+    authentication_classes = ()
     permission_classes = (AllowAny,)
 
     def get(self, request, uidb64, token):
