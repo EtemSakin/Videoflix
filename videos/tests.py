@@ -5,6 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -16,6 +17,7 @@ from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import close_old_connections, connection
+from django.db.models.fields.files import FieldFile
 from django.test import (
     RequestFactory,
     SimpleTestCase,
@@ -766,6 +768,19 @@ class VideoListAPITests(APITestCase):
         response = APIClient().get(path)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_thumbnail_response_sets_private_file_headers(self):
+        """Return a protected image with private caching and MIME headers."""
+        video = self.create_video("Preview", Video.STATUS_READY)
+        video.thumbnail = "videos/thumbnails/preview.jpg"
+        video.save(update_fields=("thumbnail",))
+        with patch.object(FieldFile, "open", return_value=BytesIO(b"jpeg")):
+            response = self.client.get(
+                reverse("video_thumbnail", kwargs={"video_id": video.pk})
+            )
+        assert_private_file_response(
+            self, response, "image/jpeg", "private, max-age=300"
+        )
+
     def test_redis_cache_avoids_repeating_catalog_database_query(self):
         """Use Redis after the first catalog query."""
         self.create_video("Cached", Video.STATUS_READY)
@@ -805,3 +820,123 @@ def count_catalog_queries(captured_queries):
     return sum(
         "videos_video" in query["sql"] for query in captured_queries
     )
+
+
+def assert_private_file_response(test_case, response, content_type, cache):
+    """Assert shared cache and MIME headers on protected file responses."""
+    test_case.assertEqual(response["Content-Type"], content_type)
+    test_case.assertEqual(response["Cache-Control"], cache)
+    test_case.assertEqual(response["X-Content-Type-Options"], "nosniff")
+
+
+def assert_manifest_response(test_case, response):
+    """Assert private response headers and the exact generated playlist."""
+    assert_private_file_response(
+        test_case,
+        response,
+        "application/vnd.apple.mpegurl",
+        "private, no-store",
+    )
+    test_case.assertEqual(
+        b"".join(response.streaming_content), b"#EXTM3U\n#EXT-X-ENDLIST\n"
+    )
+
+
+class VideoManifestAPITests(APITestCase):
+    """Verify authenticated HLS manifest access and private file handling."""
+
+    def setUp(self):
+        """Configure isolated media paths and a cookie-authenticated user."""
+        self.configure_manifest_storage()
+        self.authenticate_manifest_client()
+
+    def configure_manifest_storage(self):
+        """Set temporary private paths for generated HLS assets."""
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.media_root = Path(temporary.name) / "media"
+        self.hls_root = self.media_root / "videos" / "hls"
+        self.enterContext(override_settings(
+            MEDIA_ROOT=self.media_root,
+            VIDEO_HLS_ROOT=self.hls_root,
+        ))
+
+    def authenticate_manifest_client(self):
+        """Set the project's access cookie for private manifest requests."""
+        user = User.objects.create_user(
+            "manifest@example.com", "StrongPass!73"
+        )
+        token = AccessToken.for_user(user)
+        self.client.cookies[settings.JWT_ACCESS_COOKIE_NAME] = str(token)
+
+    def create_video(self, status_value=Video.STATUS_READY):
+        """Create a video row without writing a source media file."""
+        return Video.objects.create(
+            title="Manifest film",
+            category="Drama",
+            video_file="videos/source/manifest.mp4",
+            status=status_value,
+        )
+
+    def manifest_url(self, video, resolution="480p"):
+        """Return the official HLS manifest endpoint for a video row."""
+        return reverse(
+            "video_manifest",
+            kwargs={"movie_id": video.pk, "resolution": resolution},
+        )
+
+    def write_manifest(self, video, resolution="480p"):
+        """Write a small local HLS manifest under the configured media root."""
+        path = self.hls_root / str(video.pk) / resolution / "index.m3u8"
+        path.parent.mkdir(parents=True)
+        path.write_text("#EXTM3U\n#EXT-X-ENDLIST\n")
+        return path
+
+    def test_ready_manifest_returns_private_hls_content(self):
+        """Return playlist bytes with the documented MIME type and headers."""
+        video = self.create_video()
+        self.write_manifest(video)
+        response = self.client.get(self.manifest_url(video))
+        assert_manifest_response(self, response)
+
+    def test_manifest_route_requires_cookie_authentication(self):
+        """Reject anonymous requests to private HLS manifests."""
+        video = self.create_video()
+        response = APIClient().get(self.manifest_url(video))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_missing_not_ready_and_unsupported_manifests_return_404(self):
+        """Hide unavailable media consistently without returning disk paths."""
+        ready = self.create_video()
+        pending = self.create_video(Video.STATUS_PENDING)
+        self.assert_manifest_not_found(ready)
+        self.write_manifest(ready)
+        self.assert_manifest_not_found(pending)
+        self.assert_manifest_not_found(ready, "240p")
+
+    def assert_manifest_not_found(self, video, resolution="480p"):
+        """Assert an unavailable rendition is hidden."""
+        response = self.client.get(self.manifest_url(video, resolution))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_manifest_symlinks_cannot_escape_the_hls_root(self):
+        """Reject a manifest path that resolves outside VIDEO_HLS_ROOT."""
+        video = self.create_video()
+        outside = self.hls_root.parent / "outside"
+        outside.mkdir(parents=True)
+        (outside / "index.m3u8").write_text("private")
+        rendition = self.hls_root / str(video.pk) / "480p"
+        rendition.parent.mkdir(parents=True)
+        rendition.symlink_to(outside, target_is_directory=True)
+        response = self.client.get(self.manifest_url(video))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_manifest_root_must_remain_inside_media_root(self):
+        """Reject a configured HLS directory outside private media storage."""
+        video = self.create_video()
+        outside = self.media_root.parent / "outside"
+        path = outside / str(video.pk) / "480p" / "index.m3u8"
+        path.parent.mkdir(parents=True)
+        path.write_text("#EXTM3U\n")
+        self.enterContext(override_settings(VIDEO_HLS_ROOT=outside))
+        self.assert_manifest_not_found(video)

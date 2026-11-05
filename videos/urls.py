@@ -2,7 +2,11 @@
 
 from django.urls import path
 
-from videos.views import VideoListAPIView, VideoThumbnailAPIView
+from videos.views import (
+    VideoListAPIView,
+    VideoManifestAPIView,
+    VideoThumbnailAPIView,
+)
 
 urlpatterns = [
     path("video/", VideoListAPIView.as_view(), name="video_list"),
@@ -10,5 +14,10 @@ urlpatterns = [
         "video/<int:video_id>/thumbnail/",
         VideoThumbnailAPIView.as_view(),
         name="video_thumbnail",
+    ),
+    path(
+        "video/<int:movie_id>/<str:resolution>/index.m3u8",
+        VideoManifestAPIView.as_view(),
+        name="video_manifest",
     ),
 ]
