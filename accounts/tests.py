@@ -241,6 +241,7 @@ class RegistrationEndpointTests(APITestCase):
 
     def setUp(self):
         """Prepare the route and a valid registration payload."""
+        self.client.defaults["HTTP_ORIGIN"] = "http://127.0.0.1:5500"
         self.url = reverse("register")
         self.payload = {
             "email": "FilmFan@example.com",
@@ -510,6 +511,7 @@ class LoginEndpointTests(APITestCase):
 
     def setUp(self):
         """Prepare an active account and the official login route."""
+        self.client.defaults["HTTP_ORIGIN"] = "http://127.0.0.1:5500"
         self.password = "StrongPass!73"
         self.user = User.objects.create_user(
             "login@example.com", self.password
@@ -519,6 +521,45 @@ class LoginEndpointTests(APITestCase):
             "email": self.user.email,
             "password": self.password,
         }
+
+    def test_untrusted_origin_is_rejected_before_login(self):
+        """Reject a cross-origin login attempt before credential checks."""
+        response = self.client.post(
+            self.url,
+            self.credentials,
+            format="json",
+            HTTP_ORIGIN="https://evil.example",
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_missing_origin_is_rejected_for_api_writes(self):
+        """Require browser Origin metadata on state-changing API requests."""
+        self.client.defaults.pop("HTTP_ORIGIN")
+        response = self.client.post(self.url, self.credentials, format="json")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_trusted_frontend_origin_can_login_without_csrf_header(self):
+        """Keep the official credentialed frontend login flow compatible."""
+        response = self.submit_login()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response["Access-Control-Allow-Origin"],
+            "http://127.0.0.1:5500",
+        )
+        self.assertEqual(response["Access-Control-Allow-Credentials"], "true")
+
+    def test_preflight_allows_the_configured_frontend_origin(self):
+        """Allow the JSON preflight sent before cross-origin frontend posts."""
+        response = self.client.options(
+            self.url,
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response["Access-Control-Allow-Origin"],
+            "http://127.0.0.1:5500",
+        )
 
     def submit_login(self, data=None):
         """Post credentials anonymously to the login endpoint."""
