@@ -1,10 +1,15 @@
 """Serializers for account registration."""
 
-from django.contrib.auth import get_user_model, password_validation
+from django.contrib.auth import (
+    authenticate,
+    get_user_model,
+    password_validation,
+)
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 User = get_user_model()
+LOGIN_ERROR = "Invalid email or password."
 
 
 class RegistrationSerializer(serializers.Serializer):
@@ -71,3 +76,33 @@ class RegistrationSerializer(serializers.Serializer):
         return User.objects.create_user(
             password=password, is_active=False, **validated_data
         )
+
+
+class LoginSerializer(serializers.Serializer):
+    """Authenticate an active user with an email address and password."""
+
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+
+    def to_internal_value(self, data):
+        """Reject fields outside the documented login request."""
+        if hasattr(data, "keys") and set(data.keys()) - set(self.fields):
+            raise serializers.ValidationError(
+                {"detail": "Unexpected fields are not allowed."}
+            )
+        return super().to_internal_value(data)
+
+    def validate_email(self, value):
+        """Normalize email casing to match stored user addresses."""
+        return value.strip().lower()
+
+    def validate(self, attrs):
+        """Authenticate credentials without distinguishing account failures."""
+        user = authenticate(
+            request=self.context.get("request"),
+            email=attrs["email"],
+            password=attrs["password"],
+        )
+        if user is None:
+            raise serializers.ValidationError({"detail": LOGIN_ERROR})
+        return {"user": user}

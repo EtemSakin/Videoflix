@@ -1,5 +1,6 @@
 """API views for account endpoints."""
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.db import IntegrityError, transaction
@@ -9,15 +10,21 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from accounts.emails import EmailDeliveryError, send_activation_email
-from accounts.serializers import RegistrationSerializer
+from accounts.serializers import (
+    LOGIN_ERROR,
+    LoginSerializer,
+    RegistrationSerializer,
+)
 
 EMAIL_UNIQUE_CONSTRAINTS = {
     "accounts_user_email_ci_unique",
     "accounts_user_email_key",
 }
 REGISTRATION_ERROR = {"detail": "Registration could not be completed."}
+LOGIN_ERROR_RESPONSE = {"detail": LOGIN_ERROR}
 ACTIVATION_ERROR = {"message": "Invalid or expired activation link."}
 ACTIVATION_SUCCESS = {"message": "Account successfully activated."}
 User = get_user_model()
@@ -40,6 +47,23 @@ class RegistrationAPIView(APIView):
         except EmailDeliveryError:
             return email_error_response()
         return registration_success_response(user)
+
+
+class LoginAPIView(APIView):
+    """Authenticate users and issue HttpOnly JWT cookies."""
+
+    permission_classes = (AllowAny,)
+
+    def post(self, request):
+        """Validate credentials and return the documented login response."""
+        serializer = LoginSerializer(
+            data=request.data, context={"request": request}
+        )
+        if not serializer.is_valid():
+            return Response(
+                LOGIN_ERROR_RESPONSE, status=status.HTTP_400_BAD_REQUEST
+            )
+        return login_success_response(serializer.validated_data["user"])
 
 
 class AccountActivationAPIView(APIView):
@@ -79,6 +103,41 @@ def activate_user(uid, token):
     except (User.DoesNotExist, TypeError, ValueError, OverflowError):
         return False
     return True
+
+
+def login_success_response(user):
+    """Return the login contract and set both JWT cookies."""
+    refresh = RefreshToken.for_user(user)
+    response = Response(
+        {
+            "detail": "Login successful",
+            "user": {"id": user.pk, "username": user.email},
+        },
+        status=status.HTTP_200_OK,
+    )
+    response["Cache-Control"] = "no-store"
+    set_auth_cookies(response, refresh)
+    return response
+
+
+def set_auth_cookies(response, refresh):
+    """Set access and refresh tokens with their configured lifetimes."""
+    access = refresh.access_token
+    set_auth_cookie(response, settings.JWT_ACCESS_COOKIE_NAME, access)
+    set_auth_cookie(response, settings.JWT_REFRESH_COOKIE_NAME, refresh)
+
+
+def set_auth_cookie(response, name, token):
+    """Set one HttpOnly JWT cookie using the project's cookie settings."""
+    response.set_cookie(
+        name,
+        str(token),
+        max_age=int(token.lifetime.total_seconds()),
+        httponly=settings.JWT_COOKIE_HTTPONLY,
+        secure=settings.JWT_COOKIE_SECURE,
+        samesite=settings.JWT_COOKIE_SAMESITE,
+        path=settings.JWT_COOKIE_PATH,
+    )
 
 
 def create_registered_user(serializer):

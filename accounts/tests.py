@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
+from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
@@ -26,6 +27,7 @@ from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 
 from accounts.admin import EmailUserCreationForm
 from accounts.emails import build_activation_url
@@ -483,3 +485,104 @@ class ConcurrentAccountActivationTests(TransactionTestCase):
         self.assertCountEqual(statuses, [200, 400])
         self.assertEqual(len(set(backend_pids)), 2)
         self.assertTrue(User.objects.get(pk=self.user.pk).is_active)
+
+
+class LoginEndpointTests(APITestCase):
+    """Verify email login responses and JWT cookie behavior."""
+
+    def setUp(self):
+        """Prepare an active account and the official login route."""
+        self.password = "StrongPass!73"
+        self.user = User.objects.create_user(
+            "login@example.com", self.password
+        )
+        self.url = reverse("login")
+        self.credentials = {
+            "email": self.user.email,
+            "password": self.password,
+        }
+
+    def submit_login(self, data=None):
+        """Post credentials anonymously to the login endpoint."""
+        payload = self.credentials if data is None else data
+        return self.client.post(self.url, payload, format="json")
+
+    def test_anonymous_login_returns_contract_and_jwt_cookies(self):
+        """Return the documented user object and HttpOnly tokens."""
+        response = self.submit_login(
+            {**self.credentials, "email": "LOGIN@example.com"}
+        )
+        expected = {
+            "detail": "Login successful",
+            "user": {"id": self.user.pk, "username": self.user.email},
+        }
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), expected)
+        self.assertEqual(response["Cache-Control"], "no-store")
+        self.assertNotIn(self.password, response.content.decode())
+        self.assert_login_cookies(response)
+
+    def assert_login_cookies(self, response):
+        """Verify cookie attributes, lifetime, and encoded account ID."""
+        access = response.cookies[settings.JWT_ACCESS_COOKIE_NAME]
+        refresh = response.cookies[settings.JWT_REFRESH_COOKIE_NAME]
+        self.assert_cookie_attributes(access)
+        self.assert_cookie_attributes(refresh)
+        self.assert_cookie_user(access, AccessToken)
+        self.assert_cookie_user(refresh, RefreshToken)
+
+    def assert_cookie_attributes(self, cookie):
+        """Verify security attributes on a JWT cookie."""
+        self.assertTrue(cookie["httponly"])
+        self.assertEqual(cookie["path"], settings.JWT_COOKIE_PATH)
+        self.assertEqual(cookie["samesite"], settings.JWT_COOKIE_SAMESITE)
+        self.assertEqual(bool(cookie["secure"]), settings.JWT_COOKIE_SECURE)
+        self.assertGreater(int(cookie["max-age"]), 0)
+
+    def assert_cookie_user(self, cookie, token_class):
+        """Check the account ID encoded in an access or refresh cookie."""
+        token = token_class(cookie.value)
+        self.assertEqual(str(token["user_id"]), str(self.user.pk))
+
+    def assert_generic_login_error(self, response):
+        """Assert the same public failure for every invalid credential."""
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(), {"detail": "Invalid email or password."}
+        )
+
+    def test_authentication_failures_are_indistinguishable(self):
+        """Hide account existence behind one status and response body."""
+        wrong_password = {**self.credentials, "password": "wrong"}
+        unknown_email = {**self.credentials, "email": "absent@example.com"}
+        responses = [
+            self.submit_login(wrong_password), self.submit_login(unknown_email)
+        ]
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+        responses.append(self.submit_login())
+        for response in responses:
+            self.assert_generic_login_error(response)
+
+    def test_missing_fields_are_rejected(self):
+        """Require both documented login fields."""
+        incomplete_payloads = (
+            {},
+            {"email": self.user.email},
+            {"password": self.password},
+        )
+        for payload in incomplete_payloads:
+            self.assertEqual(
+                self.submit_login(payload).status_code,
+                status.HTTP_400_BAD_REQUEST,
+            )
+
+    def test_invalid_email_is_rejected(self):
+        """Reject malformed email input without authenticating."""
+        response = self.submit_login({**self.credentials, "email": "invalid"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unknown_fields_are_rejected(self):
+        """Reject undocumented login fields."""
+        payload = {**self.credentials, "username": "ignored"}
+        response = self.submit_login(payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
