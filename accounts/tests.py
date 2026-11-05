@@ -819,6 +819,86 @@ class TokenRefreshEndpointTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
 
+class LogoutEndpointTests(APITestCase):
+    """Verify logout blacklists refresh tokens and expires auth cookies."""
+
+    def setUp(self):
+        """Create an active user and cookies for logout requests."""
+        self.user = User.objects.create_user(
+            "logout@example.com", "StrongPass!73"
+        )
+        self.refresh = RefreshToken.for_user(self.user)
+        self.raw_refresh = str(self.refresh)
+        self.url = reverse("logout")
+        self.client.defaults["HTTP_ORIGIN"] = "http://127.0.0.1:5500"
+        self.client.cookies[settings.JWT_ACCESS_COOKIE_NAME] = str(
+            self.refresh.access_token
+        )
+
+    def submit_logout(self, token=None):
+        """Post with the chosen refresh cookie and an access cookie."""
+        value = self.raw_refresh if token is None else token
+        self.client.cookies[settings.JWT_REFRESH_COOKIE_NAME] = value
+        return self.client.post(self.url, {}, format="json")
+
+    def assert_auth_cookies_expired(self, response):
+        """Check logout expires each cookie with its configured scope."""
+        for name in (
+            settings.JWT_ACCESS_COOKIE_NAME,
+            settings.JWT_REFRESH_COOKIE_NAME,
+        ):
+            cookie = response.cookies[name]
+            self.assertEqual(cookie["max-age"], 0)
+            self.assertEqual(cookie["path"], settings.JWT_COOKIE_PATH)
+            self.assertTrue(cookie["httponly"])
+            self.assertEqual(
+                bool(cookie["secure"]), settings.JWT_COOKIE_SECURE
+            )
+            self.assertEqual(cookie["samesite"], settings.JWT_COOKIE_SAMESITE)
+
+    def test_logout_blacklists_refresh_and_expires_both_cookies(self):
+        """Blacklist the supplied token and remove browser auth cookies."""
+        response = self.submit_logout()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {"detail": "Logout successful"})
+        self.assert_auth_cookies_expired(response)
+        self.assertTrue(
+            BlacklistedToken.objects.filter(token__jti=self.refresh["jti"])
+            .exists()
+        )
+
+    def test_refresh_token_cannot_be_reused_after_logout(self):
+        """Reject the old refresh token after logout."""
+        self.submit_logout()
+        self.client.cookies[
+            settings.JWT_REFRESH_COOKIE_NAME
+        ] = self.raw_refresh
+        response = self.client.post(
+            reverse("token_refresh"),
+            {},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_missing_refresh_returns_400_and_expires_cookies(self):
+        """Return 400 for a missing refresh cookie and expire auth cookies."""
+        response = self.client.post(self.url, {}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assert_auth_cookies_expired(response)
+
+    def test_invalid_refresh_returns_401_and_expires_cookies(self):
+        """Clear browser cookies when the supplied refresh token is invalid."""
+        response = self.submit_logout("malformed-token")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assert_auth_cookies_expired(response)
+
+    def test_anonymous_logout_does_not_require_access_authentication(self):
+        """Allow logout with a refresh cookie and no access cookie."""
+        self.client.cookies.pop(settings.JWT_ACCESS_COOKIE_NAME)
+        response = self.submit_logout()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
 class ConcurrentTokenRefreshTests(TransactionTestCase):
     """Verify concurrent requests cannot rotate a token more than once."""
 

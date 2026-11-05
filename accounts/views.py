@@ -96,6 +96,22 @@ class TokenRefreshAPIView(APIView):
         return refresh_success_response(tokens)
 
 
+class LogoutAPIView(APIView):
+    """Blacklist the refresh token and clear both authentication cookies."""
+
+    authentication_classes = ()
+    permission_classes = (AllowAny,)
+
+    def post(self, request):
+        """Log out the browser and invalidate its refresh token."""
+        raw_refresh = request.COOKIES.get(settings.JWT_REFRESH_COOKIE_NAME)
+        if not raw_refresh:
+            return logout_response("Refresh token is required.", 400)
+        if not safely_blacklist_refresh_token(raw_refresh):
+            return logout_response("Invalid refresh token.", 401)
+        return logout_response("Logout successful", status.HTTP_200_OK)
+
+
 class AccountActivationAPIView(APIView):
     """Activate an inactive account through its emailed one-time link."""
 
@@ -228,6 +244,55 @@ def set_refreshed_cookies(response, tokens):
             settings.JWT_REFRESH_COOKIE_NAME,
             RefreshToken(tokens["refresh"]),
         )
+
+
+def safely_blacklist_refresh_token(raw_refresh):
+    """Return false for invalid, expired, or already-used tokens."""
+    try:
+        blacklist_refresh_token(raw_refresh)
+    except (TokenError, OutstandingToken.DoesNotExist):
+        return False
+    return True
+
+
+def blacklist_refresh_token(raw_refresh):
+    """Lock and blacklist a valid refresh token exactly once."""
+    with transaction.atomic():
+        token = UntypedToken(raw_refresh)
+        outstanding = OutstandingToken.objects.select_for_update().get(
+            jti=token["jti"]
+        )
+        if BlacklistedToken.objects.filter(token=outstanding).exists():
+            raise TokenError("Refresh token has already been used.")
+        RefreshToken(raw_refresh).blacklist()
+
+
+def logout_response(detail, status_code):
+    """Return a private logout response and expire both auth cookies."""
+    response = Response({"detail": detail}, status=status_code)
+    response["Cache-Control"] = "no-store"
+    clear_auth_cookies(response)
+    return response
+
+
+def clear_auth_cookies(response):
+    """Expire both configured JWT cookies using their original attributes."""
+    clear_auth_cookie(response, settings.JWT_ACCESS_COOKIE_NAME)
+    clear_auth_cookie(response, settings.JWT_REFRESH_COOKIE_NAME)
+
+
+def clear_auth_cookie(response, name):
+    """Expire one JWT cookie with the same scope and security flags."""
+    response.set_cookie(
+        name,
+        value="",
+        max_age=0,
+        expires="Thu, 01 Jan 1970 00:00:00 GMT",
+        path=settings.JWT_COOKIE_PATH,
+        secure=settings.JWT_COOKIE_SECURE,
+        httponly=settings.JWT_COOKIE_HTTPONLY,
+        samesite=settings.JWT_COOKIE_SAMESITE,
+    )
 
 
 def create_registered_user(serializer):
