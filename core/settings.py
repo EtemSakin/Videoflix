@@ -162,6 +162,9 @@ EMAIL_USE_SSL = os.getenv("EMAIL_USE_SSL", "false").lower() in {
 EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "10"))
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "")
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "")
+VIDEO_MAX_UPLOAD_BYTES = int(
+    os.getenv("VIDEO_MAX_UPLOAD_BYTES", str(1024**3))
+)
 
 AUTH_PASSWORD_VALIDATORS = [
     {
