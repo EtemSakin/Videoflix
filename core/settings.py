@@ -28,11 +28,14 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "accounts.apps.AccountsConfig",
     "corsheaders",
     "rest_framework",
     "django_rq",
     "rest_framework_simplejwt.token_blacklist",
 ]
+
+AUTH_USER_MODEL = "accounts.User"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
