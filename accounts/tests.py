@@ -751,6 +751,13 @@ class CookieJWTAuthenticationTests(APITestCase):
         response = self.request_with_cookie(self.access_token)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_changed_password_revokes_existing_access_token(self):
+        """Reject previously issued access tokens after password changes."""
+        self.user.set_password("AnotherStrongPass!94")
+        self.user.save(update_fields=("password",))
+        response = self.request_with_cookie(self.access_token)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
 
 class TokenRefreshEndpointTests(APITestCase):
     """Verify refresh-cookie rotation and safe endpoint responses."""
@@ -771,6 +778,12 @@ class TokenRefreshEndpointTests(APITestCase):
         self.client.cookies[settings.JWT_REFRESH_COOKIE_NAME] = value
         return self.client.post(self.url, {}, format="json")
 
+    def protected_access_response(self, token):
+        """Use an access token from a cookie on a protected DRF view."""
+        cookie = f"{settings.JWT_ACCESS_COOKIE_NAME}={token}"
+        request = APIRequestFactory().get("/protected/", HTTP_COOKIE=cookie)
+        return ProtectedCookieAPIView.as_view()(request)
+
     def test_valid_refresh_sets_rotated_httponly_cookies(self):
         """Return 200, rotate both cookies, and hide tokens from the body."""
         response = self.submit_refresh()
@@ -784,6 +797,24 @@ class TokenRefreshEndpointTests(APITestCase):
         self.assertTrue(
             BlacklistedToken.objects.filter(token__jti=self.refresh["jti"])
             .exists()
+        )
+
+    def test_refreshed_access_cookie_authenticates_protected_requests(self):
+        """Allow protected requests with an access token issued by refresh."""
+        response = self.submit_refresh()
+        token = response.cookies[settings.JWT_ACCESS_COOKIE_NAME].value
+        protected = self.protected_access_response(token)
+        self.assertEqual(protected.status_code, status.HTTP_200_OK)
+
+    def test_rotated_refresh_cookie_can_be_used_again(self):
+        """Keep rotated refresh credentials valid for the next renewal."""
+        first = self.submit_refresh()
+        rotated = first.cookies[settings.JWT_REFRESH_COOKIE_NAME].value
+        second = self.submit_refresh(rotated)
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.assertNotEqual(
+            second.cookies[settings.JWT_REFRESH_COOKIE_NAME].value, rotated
         )
 
     def test_missing_refresh_cookie_returns_400(self):
@@ -818,6 +849,13 @@ class TokenRefreshEndpointTests(APITestCase):
     def test_deleted_user_cannot_refresh(self):
         """Handle deleted token owners as invalid instead of a server error."""
         User.objects.filter(pk=self.user.pk).delete()
+        response = self.submit_refresh()
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_changed_password_rejects_existing_refresh_token(self):
+        """Reject refresh tokens issued before a password change."""
+        self.user.set_password("AnotherStrongPass!94")
+        self.user.save(update_fields=("password",))
         response = self.submit_refresh()
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
@@ -1126,6 +1164,36 @@ class PasswordResetConfirmTests(APITestCase):
         User.objects.filter(pk=self.user.pk).update(is_active=False)
         response = self.submit_confirmation()
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_password_reset_revokes_existing_access_and_refresh_tokens(self):
+        """Invalidate all existing browser sessions after password reset."""
+        refresh = RefreshToken.for_user(self.user)
+        access = str(refresh.access_token)
+        self.client.cookies[settings.JWT_REFRESH_COOKIE_NAME] = str(refresh)
+        response = self.submit_confirmation()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(self.is_refresh_blacklisted(refresh["jti"]))
+        self.assertEqual(self.old_refresh_status(str(refresh)), 401)
+        self.assertEqual(self.old_access_status(access), 401)
+
+    def is_refresh_blacklisted(self, token_id):
+        """Check that reset added the user's prior token to the blacklist."""
+        return BlacklistedToken.objects.filter(token__jti=token_id).exists()
+
+    def old_refresh_status(self, token):
+        """Try to reuse one refresh token issued before a password reset."""
+        self.client.cookies[settings.JWT_REFRESH_COOKIE_NAME] = token
+        response = self.client.post(
+            reverse("token_refresh"), {}, format="json"
+        )
+        return response.status_code
+
+    def old_access_status(self, token):
+        """Try protected access using the old access token."""
+        cookie = f"{settings.JWT_ACCESS_COOKIE_NAME}={token}"
+        request = APIRequestFactory().get("/protected/", HTTP_COOKIE=cookie)
+        response = ProtectedCookieAPIView.as_view()(request)
+        return response.status_code
 
 
 class ConcurrentPasswordResetTests(TransactionTestCase):

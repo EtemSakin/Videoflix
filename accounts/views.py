@@ -15,6 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from rest_framework_simplejwt.settings import api_settings
 from rest_framework_simplejwt.token_blacklist.models import (
     BlacklistedToken,
     OutstandingToken,
@@ -24,6 +25,7 @@ from rest_framework_simplejwt.tokens import (
     RefreshToken,
     UntypedToken,
 )
+from rest_framework_simplejwt.utils import get_md5_hash_password
 
 from accounts.emails import (
     EmailDeliveryError,
@@ -242,6 +244,7 @@ def rotate_refresh_token(raw_refresh):
     """Lock and rotate an unblacklisted refresh token once."""
     with transaction.atomic():
         token = UntypedToken(raw_refresh)
+        lock_refresh_token_owner(token)
         outstanding = OutstandingToken.objects.select_for_update().get(
             jti=token["jti"]
         )
@@ -250,6 +253,23 @@ def rotate_refresh_token(raw_refresh):
         serializer = TokenRefreshSerializer(data={"refresh": raw_refresh})
         serializer.is_valid(raise_exception=True)
         return serializer.validated_data
+
+
+def lock_refresh_token_owner(token):
+    """Lock and validate the active account bound to a refresh token."""
+    user = User.objects.select_for_update().get(
+        pk=token[api_settings.USER_ID_CLAIM]
+    )
+    if not user.is_active or not refresh_token_matches_user(token, user):
+        raise TokenError("Refresh token no longer matches its account.")
+
+
+def refresh_token_matches_user(token, user):
+    """Check that a refresh token matches the user's current password hash."""
+    if not api_settings.CHECK_REVOKE_TOKEN:
+        return True
+    claim = token.get(api_settings.REVOKE_TOKEN_CLAIM)
+    return claim == get_md5_hash_password(user.password)
 
 
 def safely_rotate_refresh_token(raw_refresh):
@@ -261,6 +281,7 @@ def safely_rotate_refresh_token(raw_refresh):
         AuthenticationFailed,
         User.DoesNotExist,
         OutstandingToken.DoesNotExist,
+        KeyError,
     ):
         return None
 
@@ -376,6 +397,7 @@ def apply_password_reset(uid, token, data):
         errors = validate_and_set_password(user, data)
         if errors:
             return None, errors
+        blacklist_user_refresh_tokens(user)
     return True, None
 
 
@@ -389,6 +411,13 @@ def validate_and_set_password(user, data):
     user.set_password(serializer.validated_data["new_password"])
     user.save(update_fields=("password",))
     return None
+
+
+def blacklist_user_refresh_tokens(user):
+    """Blacklist all existing refresh sessions after a password reset."""
+    outstanding = OutstandingToken.objects.filter(user=user)
+    for token in outstanding:
+        BlacklistedToken.objects.get_or_create(token=token)
 
 
 def invalid_password_reset_response():
