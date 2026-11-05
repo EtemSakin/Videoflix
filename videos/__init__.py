@@ -1,0 +1,1 @@
+"""Video catalog application package."""
