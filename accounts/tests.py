@@ -1031,6 +1031,16 @@ class PasswordResetRequestTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
 
+    def test_smtp_oserror_is_normalized_by_the_email_service(self):
+        """Hide a low-level SMTP failure behind the generic API response."""
+        send_path = "accounts.emails.EmailMultiAlternatives.send"
+        with patch(send_path, side_effect=OSError("SMTP offline")):
+            with self.assertLogs("accounts.views", level="ERROR"):
+                response = self.submit_request()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
+        self.assertEqual(mail.outbox, [])
+
 
 @override_settings(
     EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
@@ -1363,11 +1373,8 @@ class ConcurrentPasswordResetTests(TransactionTestCase):
         statuses, backend_pids = zip(*results)
         self.assertCountEqual(statuses, [200, 400])
         self.assertEqual(len(set(backend_pids)), 2)
-        self.assertTrue(
-            User.objects.get(email="parallel-reset@example.com").check_password(
-                self.payload["new_password"]
-            )
-        )
+        user = User.objects.get(email="parallel-reset@example.com")
+        self.assertTrue(user.check_password(self.payload["new_password"]))
 
 
 class ConcurrentTokenRefreshTests(TransactionTestCase):

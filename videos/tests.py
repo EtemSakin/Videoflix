@@ -863,6 +863,17 @@ class VideoListAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data[0]["title"], "Fallback")
 
+    def test_catalog_survives_redis_invalidation_failure(self):
+        """Serve listings when Redis invalidation fails."""
+        video = self.create_video("Initial", Video.STATUS_READY)
+        with patch("videos.cache.cache.delete", side_effect=RedisError):
+            with self.captureOnCommitCallbacks(execute=True):
+                video.title = "Updated"
+                video.save(update_fields=("title",))
+        response = self.client.get(reverse("video_list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data[0]["title"], "Updated")
+
 
 def count_catalog_queries(captured_queries):
     """Count only database statements that read the video table."""
