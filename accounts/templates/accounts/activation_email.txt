@@ -1,0 +1,5 @@
+Activate your Videoflix account
+
+Confirm your email address to start using Videoflix:
+
+{{ activation_url }}

@@ -1,14 +1,25 @@
 """Tests for email-based users and Django Admin integration."""
 
+from smtplib import SMTPException
+from types import SimpleNamespace
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
+
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
+from django.contrib.auth.tokens import default_token_generator
+from django.core import mail
 from django.db import IntegrityError, transaction
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
+from rest_framework import status
+from rest_framework.test import APITestCase
 
 from accounts.admin import EmailUserCreationForm
 from accounts.serializers import RegistrationSerializer
-
 
 User = get_user_model()
 
@@ -192,3 +203,142 @@ class RegistrationSerializerTests(TestCase):
             str(serializer.errors["email"][0]),
             "Registration could not be completed.",
         )
+
+
+@override_settings(
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+    DEFAULT_FROM_EMAIL="Videoflix <noreply@example.com>",
+    FRONTEND_BASE_URL="http://127.0.0.1:5500",
+)
+class RegistrationEndpointTests(APITestCase):
+    """Test registration API behavior and activation email delivery."""
+
+    def setUp(self):
+        """Prepare the route and a valid registration payload."""
+        self.url = reverse("register")
+        self.payload = {
+            "email": "FilmFan@example.com",
+            "password": "StrongPass!73",
+            "confirmed_password": "StrongPass!73",
+        }
+
+    def submit_registration(self, payload=None):
+        """Post JSON registration data without authenticating the client."""
+        data = self.payload if payload is None else payload
+        return self.client.post(self.url, data, format="json")
+
+    def test_three_fields_register_an_inactive_user_without_auth(self):
+        """Register anonymously with documented fields and hash password."""
+        response = self.submit_registration()
+        user = User.objects.get(email="filmfan@example.com")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(user.is_active)
+        self.assertTrue(user.check_password("StrongPass!73"))
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_optional_checked_privacy_policy_is_accepted(self):
+        """Accept the frontend checkbox without storing it on the user."""
+        payload = {**self.payload, "privacy_policy": "on"}
+        response = self.submit_registration(payload)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertNotIn("privacy_policy", {f.name for f in User._meta.fields})
+
+    def test_unchecked_privacy_policy_values_are_rejected(self):
+        """Reject privacy checkbox values that do not express consent."""
+        for value in (False, "false", "off", "not-consent"):
+            response = self.submit_registration(
+                {**self.payload, "privacy_policy": value}
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_other_unknown_fields_are_rejected(self):
+        """Reject fields beyond the documented contract and checkbox."""
+        payload = {**self.payload, "username": "fan"}
+        self.assertEqual(self.submit_registration(payload).status_code, 400)
+
+    def test_invalid_email_is_rejected(self):
+        """Reject malformed registration email through the API."""
+        payload = {**self.payload, "email": "not-an-email"}
+        self.assertEqual(self.submit_registration(payload).status_code, 400)
+
+    def test_missing_required_fields_are_rejected(self):
+        """Reject requests missing any documented required field."""
+        for field in ("email", "password", "confirmed_password"):
+            payload = self.payload.copy()
+            del payload[field]
+            response = self.submit_registration(payload)
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_mismatched_passwords_are_rejected(self):
+        """Reject password confirmation that does not match the password."""
+        payload = {**self.payload, "confirmed_password": "DifferentPass!73"}
+        self.assertEqual(self.submit_registration(payload).status_code, 400)
+
+    def test_weak_password_is_rejected(self):
+        """Reject weak passwords through the API serializer validators."""
+        payload = {**self.payload, "password": "password"}
+        payload["confirmed_password"] = "password"
+        self.assertEqual(self.submit_registration(payload).status_code, 400)
+
+    def test_case_insensitive_duplicate_email_is_rejected(self):
+        """Reject duplicate registration and return a generic response."""
+        User.objects.create_user("filmfan@example.com", "StrongPass!73")
+        payload = {**self.payload, "email": "FILMFAN@example.com"}
+        response = self.submit_registration(payload)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(),
+            {"detail": "Registration could not be completed."},
+        )
+
+    def test_activation_email_contains_expected_url_and_valid_token(self):
+        """Verify frontend activation parameters and Django token validity."""
+        self.submit_registration()
+        user = User.objects.get(email="filmfan@example.com")
+        link = mail.outbox[0].body.strip().splitlines()[-1]
+        query = parse_qs(urlparse(link).query)
+        expected_uid = urlsafe_base64_encode(force_bytes(user.pk))
+        self.assertEqual(urlparse(link).path, "/pages/auth/activate.html")
+        self.assertEqual(query["uid"], [expected_uid])
+        self.assertTrue(
+            default_token_generator.check_token(user, query["token"][0])
+        )
+
+    def test_email_has_html_and_text_alternatives(self):
+        """Deliver both plaintext and HTML activation email bodies."""
+        self.submit_registration()
+        self.assertEqual(len(mail.outbox[0].alternatives), 1)
+        self.assertEqual(mail.outbox[0].alternatives[0][1], "text/html")
+        self.assertIn("activate.html?uid=", mail.outbox[0].alternatives[0][0])
+
+    def test_response_contains_no_password_or_activation_token(self):
+        """Keep credentials and activation tokens out of the API response."""
+        response = self.submit_registration()
+        link = mail.outbox[0].body.splitlines()[-1]
+        token = parse_qs(urlparse(link).query)["token"][0]
+        self.assertNotIn("StrongPass!73", response.content.decode())
+        self.assertNotIn(token, response.content.decode())
+        self.assertEqual(set(response.json()), {"user"})
+
+    def test_email_failure_rolls_back_user_and_returns_service_error(self):
+        """Roll back user creation when SMTP delivery fails."""
+        send_path = "accounts.emails.EmailMultiAlternatives.send"
+        with patch(send_path, side_effect=SMTPException):
+            response = self.submit_registration()
+        self.assertEqual(
+            response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        user_exists = User.objects.filter(email="filmfan@example.com").exists()
+        self.assertFalse(user_exists)
+
+    def test_concurrent_email_conflict_returns_controlled_error(self):
+        """Return a safe response for a concurrent email uniqueness error."""
+        cause = Exception("duplicate key")
+        cause.diag = SimpleNamespace(
+            constraint_name="accounts_user_email_ci_unique"
+        )
+        error = IntegrityError("duplicate email")
+        error.__cause__ = cause
+        with patch("accounts.views.create_registered_user", side_effect=error):
+            response = self.submit_registration()
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

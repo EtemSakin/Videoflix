@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Activate your Videoflix account</title>
+  </head>
+  <body style="margin:0;background:#101010;color:#f5f5f5;font-family:Arial,sans-serif">
+    <main style="box-sizing:border-box;margin:0 auto;max-width:600px;padding:40px 24px">
+      <h1 style="color:#e50914">Videoflix</h1>
+      <h2>Confirm your email address</h2>
+      <p>Activate your account to start using Videoflix.</p>
+      <p style="margin:32px 0">
+        <a href="{{ activation_url }}" style="background:#e50914;border-radius:4px;color:#fff;padding:14px 22px;text-decoration:none">
+          Activate account
+        </a>
+      </p>
+      <p>If the button does not work, copy this link into your browser:</p>
+      <p><a href="{{ activation_url }}" style="color:#f5f5f5;overflow-wrap:anywhere">{{ activation_url }}</a></p>
+    </main>
+  </body>
+</html>
