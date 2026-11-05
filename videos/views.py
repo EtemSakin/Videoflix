@@ -136,12 +136,21 @@ def resolve_hls_artifact(movie_id, resolution, filename):
     media_root = Path(settings.MEDIA_ROOT).resolve()
     if not root.is_relative_to(media_root):
         return None
-    candidate = root / str(movie_id) / resolution / filename
+    return resolve_rendition_artifact(root, movie_id, resolution, filename)
+
+
+def resolve_rendition_artifact(root, movie_id, resolution, filename):
+    """Reject symlinks and resolve one asset inside its rendition directory."""
+    rendition = root / str(movie_id) / resolution
+    candidate = rendition / filename
     try:
+        resolved_rendition = rendition.resolve(strict=True)
         resolved = candidate.resolve(strict=True)
     except (OSError, RuntimeError):
         return None
-    if not resolved.is_file() or not resolved.is_relative_to(root):
+    if resolved_rendition != rendition or resolved != candidate:
+        return None
+    if not resolved.is_file() or not resolved.is_relative_to(rendition):
         return None
     return resolved
 

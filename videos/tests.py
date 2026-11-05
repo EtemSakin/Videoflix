@@ -948,6 +948,18 @@ class VideoManifestAPITests(APITestCase):
         response = self.client.get(self.manifest_url(video))
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_manifest_symlinks_cannot_cross_video_boundaries(self):
+        """Reject a rendition directory linked to another video's files."""
+        video = self.create_video()
+        other_video = self.create_video()
+        other_rendition = self.hls_root / str(other_video.pk) / "480p"
+        other_rendition.mkdir(parents=True)
+        (other_rendition / "index.m3u8").write_text("private")
+        rendition = self.hls_root / str(video.pk) / "480p"
+        rendition.parent.mkdir(parents=True)
+        rendition.symlink_to(other_rendition, target_is_directory=True)
+        self.assert_manifest_not_found(video)
+
     def test_manifest_root_must_remain_inside_media_root(self):
         """Reject a configured HLS directory outside private media storage."""
         video = self.create_video()
