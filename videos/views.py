@@ -3,12 +3,14 @@
 from django.core.exceptions import SuspiciousFileOperation
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
-from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from videos.cache import (
+    absolute_thumbnail_urls,
+    get_video_catalog_data,
+)
 from videos.models import Video
-from videos.serializers import VideoSerializer
 
 THUMBNAIL_CONTENT_TYPES = {
     ".jpg": "image/jpeg",
@@ -18,14 +20,15 @@ THUMBNAIL_CONTENT_TYPES = {
 }
 
 
-class VideoListAPIView(generics.ListAPIView):
+class VideoListAPIView(APIView):
     """List ready videos in the order expected by the dashboard."""
 
-    serializer_class = VideoSerializer
-    pagination_class = None
-    queryset = Video.objects.filter(status=Video.STATUS_READY).order_by(
-        "-created_at", "id"
-    )
+    def get(self, request):
+        """Return the cached catalog with URLs for the requesting host."""
+        data = get_video_catalog_data()
+        response = Response(absolute_thumbnail_urls(data, request))
+        response["Cache-Control"] = "private, no-store"
+        return response
 
 
 class VideoThumbnailAPIView(APIView):

@@ -28,6 +28,4 @@ class VideoSerializer(serializers.ModelSerializer):
         """Return a protected thumbnail URL or null before one exists."""
         if not video.thumbnail:
             return None
-        url = reverse("video_thumbnail", kwargs={"video_id": video.pk})
-        request = self.context.get("request")
-        return request.build_absolute_uri(url) if request else url
+        return reverse("video_thumbnail", kwargs={"video_id": video.pk})

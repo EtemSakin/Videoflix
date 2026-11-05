@@ -1,24 +1,30 @@
 """Tests for the video catalog model."""
 
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
 from django.test import (
     RequestFactory,
     SimpleTestCase,
     TestCase,
     override_settings,
 )
+from django.test.utils import CaptureQueriesContext
 from django.urls import Resolver404, resolve, reverse
 from django.utils import timezone
+from redis.exceptions import RedisError
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.tokens import AccessToken
 
 from videos.admin import VideoAdmin, VideoAdminForm
+from videos.cache import VIDEO_CATALOG_CACHE_KEY
 from videos.models import Video
 
 User = get_user_model()
@@ -168,6 +174,8 @@ class VideoListAPITests(APITestCase):
 
     def setUp(self):
         """Authenticate a browser-style client with an access cookie."""
+        cache.delete(VIDEO_CATALOG_CACHE_KEY)
+        self.addCleanup(cache.delete, VIDEO_CATALOG_CACHE_KEY)
         user = User.objects.create_user(
             "catalog@example.com", "StrongPass!73"
         )
@@ -238,3 +246,43 @@ class VideoListAPITests(APITestCase):
         path = reverse("video_thumbnail", kwargs={"video_id": video.pk})
         response = APIClient().get(path)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_redis_cache_avoids_repeating_catalog_database_query(self):
+        """Use Redis after the first catalog query."""
+        self.create_video("Cached", Video.STATUS_READY)
+        with CaptureQueriesContext(connection) as first_queries:
+            self.client.get(reverse("video_list"))
+        with CaptureQueriesContext(connection) as cached_queries:
+            response = self.client.get(reverse("video_list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(count_catalog_queries(first_queries), 1)
+        self.assertEqual(count_catalog_queries(cached_queries), 0)
+
+    def test_committed_video_changes_invalidate_redis_catalog(self):
+        """Refresh cached fields after save and remove data after deletion."""
+        video = self.create_video("Before", Video.STATUS_READY)
+        self.client.get(reverse("video_list"))
+        with self.captureOnCommitCallbacks(execute=True):
+            video.title = "After"
+            video.save(update_fields=("title",))
+        updated = self.client.get(reverse("video_list"))
+        self.assertEqual(updated.data[0]["title"], "After")
+        with self.captureOnCommitCallbacks(execute=True):
+            video.delete()
+        self.assertEqual(self.client.get(reverse("video_list")).data, [])
+
+    def test_catalog_falls_back_to_database_when_redis_is_unavailable(self):
+        """Keep the catalog available through temporary Redis failures."""
+        self.create_video("Fallback", Video.STATUS_READY)
+        with patch("videos.cache.cache.get", side_effect=RedisError):
+            with patch("videos.cache.cache.set", side_effect=RedisError):
+                response = self.client.get(reverse("video_list"))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data[0]["title"], "Fallback")
+
+
+def count_catalog_queries(captured_queries):
+    """Count only database statements that read the video table."""
+    return sum(
+        "videos_video" in query["sql"] for query in captured_queries
+    )
