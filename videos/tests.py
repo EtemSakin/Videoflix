@@ -973,6 +973,25 @@ class VideoManifestAPITests(APITestCase):
         response = APIClient().get(self.manifest_url(video))
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    def test_manipulated_cookie_cannot_fetch_manifest(self):
+        """Reject malformed JWT cookies without serving private manifests."""
+        video = self.create_video()
+        client = APIClient()
+        client.cookies[settings.JWT_ACCESS_COOKIE_NAME] = "tampered.token"
+        response = client.get(self.manifest_url(video))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_expired_cookie_cannot_fetch_manifest(self):
+        """Reject a correctly signed access cookie after its expiration."""
+        video = self.create_video()
+        user = User.objects.create_user("expired@example.com", "StrongPass!73")
+        token = AccessToken.for_user(user)
+        token.set_exp(from_time=timezone.now() - timedelta(days=1))
+        client = APIClient()
+        client.cookies[settings.JWT_ACCESS_COOKIE_NAME] = str(token)
+        response = client.get(self.manifest_url(video))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
     def test_missing_not_ready_and_unsupported_manifests_return_404(self):
         """Hide unavailable media consistently without returning disk paths."""
         ready = self.create_video()
@@ -1011,6 +1030,13 @@ class VideoManifestAPITests(APITestCase):
         rendition.symlink_to(other_rendition, target_is_directory=True)
         self.assert_manifest_not_found(video)
 
+    def test_encoded_path_traversal_cannot_fetch_manifest_files(self):
+        """Keep encoded path separators from resolving private disk paths."""
+        video = self.create_video()
+        path = f"/api/video/{video.pk}/480p/%2e%2e%2Fsecret.ts"
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
     def test_manifest_root_must_remain_inside_media_root(self):
         """Reject a configured HLS directory outside private media storage."""
         video = self.create_video()
@@ -1042,6 +1068,25 @@ class VideoManifestAPITests(APITestCase):
             self.segment_url(video, "segment_00000.ts")
         )
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_manipulated_cookie_cannot_fetch_segments(self):
+        """Reject tampered access cookies on protected segment routes."""
+        video = self.create_video()
+        client = APIClient()
+        client.cookies[settings.JWT_ACCESS_COOKIE_NAME] = "tampered.token"
+        response = client.get(self.segment_url(video, "segment_00000.ts"))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_segment_symlink_to_foreign_file_is_rejected(self):
+        """Reject a segment file that is a symlink to another media path."""
+        video = self.create_video()
+        outside = self.hls_root.parent / "foreign.ts"
+        outside.parent.mkdir(parents=True)
+        outside.write_bytes(b"foreign")
+        path = self.hls_root / str(video.pk) / "480p" / "segment_00000.ts"
+        path.parent.mkdir(parents=True)
+        path.symlink_to(outside)
+        self.assert_segment_not_found(video, "segment_00000.ts")
 
     def test_missing_unready_and_invalid_segments_return_404(self):
         """Hide absent and unsupported HLS artifacts consistently."""
