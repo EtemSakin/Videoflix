@@ -824,6 +824,7 @@ def count_catalog_queries(captured_queries):
 
 def assert_private_file_response(test_case, response, content_type, cache):
     """Assert shared cache and MIME headers on protected file responses."""
+    test_case.assertEqual(response.status_code, 200)
     test_case.assertEqual(response["Content-Type"], content_type)
     test_case.assertEqual(response["Cache-Control"], cache)
     test_case.assertEqual(response["X-Content-Type-Options"], "nosniff")
@@ -892,6 +893,22 @@ class VideoManifestAPITests(APITestCase):
         path.write_text("#EXTM3U\n#EXT-X-ENDLIST\n")
         return path
 
+    def segment_url(self, video, segment, resolution="480p", trailing=True):
+        """Return a segment URL with or without the documented final slash."""
+        route = "video_segment" if trailing else "video_segment_no_slash"
+        return reverse(route, kwargs={
+            "movie_id": video.pk,
+            "resolution": resolution,
+            "segment": segment,
+        })
+
+    def write_segment(self, video, segment="segment_00000.ts"):
+        """Write one sample binary transport-stream artifact."""
+        path = self.hls_root / str(video.pk) / "480p" / segment
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"mpeg-ts-segment")
+        return path
+
     def test_ready_manifest_returns_private_hls_content(self):
         """Return playlist bytes with the documented MIME type and headers."""
         video = self.create_video()
@@ -940,3 +957,42 @@ class VideoManifestAPITests(APITestCase):
         path.write_text("#EXTM3U\n")
         self.enterContext(override_settings(VIDEO_HLS_ROOT=outside))
         self.assert_manifest_not_found(video)
+
+    def test_segment_routes_stream_only_supported_binary_files(self):
+        """Serve FFmpeg segments with their private binary response headers."""
+        video = self.create_video()
+        self.write_segment(video)
+        for trailing in (True, False):
+            response = self.client.get(
+                self.segment_url(video, "segment_00000.ts", trailing=trailing)
+            )
+            assert_private_file_response(
+                self, response, "video/MP2T", "private, no-store"
+            )
+            body = b"".join(response.streaming_content)
+            self.assertEqual(body, b"mpeg-ts-segment")
+
+    def test_segment_route_requires_cookie_authentication(self):
+        """Reject anonymous requests for protected HLS transport streams."""
+        video = self.create_video()
+        response = APIClient().get(
+            self.segment_url(video, "segment_00000.ts")
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_missing_unready_and_invalid_segments_return_404(self):
+        """Hide absent and unsupported HLS artifacts consistently."""
+        ready = self.create_video()
+        pending = self.create_video(Video.STATUS_PENDING)
+        self.write_segment(ready)
+        self.assert_segment_not_found(ready, "missing_00000.ts")
+        self.assert_segment_not_found(ready, "segment_00000.ts.bak")
+        self.assert_segment_not_found(ready, "segment_00000.ts", "240p")
+        self.assert_segment_not_found(pending, "segment_00000.ts")
+
+    def assert_segment_not_found(self, video, segment, resolution="480p"):
+        """Assert invalid or unavailable segment requests return 404."""
+        response = self.client.get(
+            self.segment_url(video, segment, resolution=resolution)
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)

@@ -5,6 +5,7 @@ from django.urls import path
 from videos.views import (
     VideoListAPIView,
     VideoManifestAPIView,
+    VideoSegmentAPIView,
     VideoThumbnailAPIView,
 )
 
@@ -19,5 +20,15 @@ urlpatterns = [
         "video/<int:movie_id>/<str:resolution>/index.m3u8",
         VideoManifestAPIView.as_view(),
         name="video_manifest",
+    ),
+    path(
+        "video/<int:movie_id>/<str:resolution>/<str:segment>/",
+        VideoSegmentAPIView.as_view(),
+        name="video_segment",
+    ),
+    path(
+        "video/<int:movie_id>/<str:resolution>/<str:segment>",
+        VideoSegmentAPIView.as_view(),
+        name="video_segment_no_slash",
     ),
 ]
