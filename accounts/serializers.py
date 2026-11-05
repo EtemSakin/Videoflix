@@ -106,3 +106,21 @@ class LoginSerializer(serializers.Serializer):
         if user is None:
             raise serializers.ValidationError({"detail": LOGIN_ERROR})
         return {"user": user}
+
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    """Validate the public password-reset request payload."""
+
+    email = serializers.EmailField()
+
+    def to_internal_value(self, data):
+        """Reject input fields outside the documented email request."""
+        if hasattr(data, "keys") and set(data.keys()) - set(self.fields):
+            raise serializers.ValidationError(
+                {"detail": "Unexpected fields are not allowed."}
+            )
+        return super().to_internal_value(data)
+
+    def validate_email(self, value):
+        """Normalize email casing before the user lookup."""
+        return value.strip().lower()

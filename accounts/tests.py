@@ -35,10 +35,18 @@ from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 
 from accounts.admin import EmailUserCreationForm
 from accounts.authentication import CookieJWTAuthentication
-from accounts.emails import build_activation_url
-from accounts.serializers import RegistrationSerializer
+from accounts.emails import (
+    EmailDeliveryError,
+    build_activation_url,
+)
+from accounts.serializers import (
+    RegistrationSerializer,
+)
 
 User = get_user_model()
+PASSWORD_RESET_RESPONSE = {
+    "detail": "An email has been sent to reset your password."
+}
 
 
 class ProtectedCookieAPIView(APIView):
@@ -899,6 +907,91 @@ class LogoutEndpointTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
 
+@override_settings(
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+    DEFAULT_FROM_EMAIL="Videoflix <noreply@example.com>",
+    FRONTEND_BASE_URL="http://127.0.0.1:5500",
+)
+class PasswordResetRequestTests(APITestCase):
+    """Verify private password-reset requests and multipart email links."""
+
+    def setUp(self):
+        """Create an active account and the public reset request route."""
+        self.user = User.objects.create_user(
+            "reset@example.com", "StrongPass!73"
+        )
+        self.url = reverse("password_reset")
+        self.client.defaults["HTTP_ORIGIN"] = "http://127.0.0.1:5500"
+
+    def submit_request(self, email=None, **extra):
+        """Submit the documented email field with optional unknown values."""
+        payload = {"email": email or self.user.email, **extra}
+        return self.client.post(self.url, payload, format="json")
+
+    def assert_reset_email(self, message):
+        """Verify the actual frontend link and return its valid token."""
+        reset_url = extract_reset_url(message.body)
+        query = parse_qs(urlparse(reset_url).query)
+        prefix = "http://127.0.0.1:5500/pages/auth/confirm_password.html?"
+        self.assertTrue(reset_url.startswith(prefix))
+        self.assertEqual(query["uid"][0], encode_user_id(self.user))
+        token = query["token"][0]
+        self.assertTrue(default_token_generator.check_token(self.user, token))
+        html_query = f"uid={query['uid'][0]}&amp;token={token}"
+        self.assertIn(html_query, message.alternatives[0][0])
+        return token
+
+    def test_known_account_receives_reset_email_and_generic_response(self):
+        """Email the official reset page and keep token data out of JSON."""
+        response = self.submit_request("RESET@example.com")
+        message = mail.outbox[0]
+        token = self.assert_reset_email(message)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(len(message.alternatives), 1)
+        self.assertNotIn(token, response.content.decode())
+
+    def test_unknown_account_gets_the_same_generic_response(self):
+        """Return the same status and body without sending an email."""
+        known = self.submit_request()
+        unknown = self.submit_request("unknown@example.com")
+        self.assertEqual(unknown.status_code, known.status_code)
+        self.assertEqual(unknown.data, known.data)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_inactive_account_does_not_receive_reset_email(self):
+        """Keep unactivated accounts private and avoid reset messages."""
+        self.user.is_active = False
+        self.user.save(update_fields=("is_active",))
+        response = self.submit_request()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
+        self.assertEqual(mail.outbox, [])
+
+    def test_invalid_email_is_rejected(self):
+        """Reject malformed email addresses before account lookup."""
+        response = self.submit_request("invalid-email")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(mail.outbox, [])
+
+    def test_unknown_request_fields_are_rejected(self):
+        """Accept only the documented email field."""
+        response = self.submit_request(extra="unexpected")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_email_delivery_failure_keeps_the_generic_response(self):
+        """Avoid disclosing valid accounts when SMTP delivery fails."""
+        failure = patch(
+            "accounts.views.send_password_reset_email",
+            side_effect=EmailDeliveryError,
+        )
+        with failure, self.assertLogs("accounts.views", level="ERROR"):
+            response = self.submit_request()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
+
+
 class ConcurrentTokenRefreshTests(TransactionTestCase):
     """Verify concurrent requests cannot rotate a token more than once."""
 
@@ -955,3 +1048,17 @@ def submit_refresh_request(url, token):
         format="json",
         HTTP_ORIGIN="http://127.0.0.1:5500",
     )
+
+
+def extract_reset_url(body):
+    """Extract the frontend URL from a plaintext password-reset message."""
+    return next(
+        line.strip()
+        for line in body.splitlines()
+        if line.strip().startswith("http")
+    )
+
+
+def encode_user_id(user):
+    """Encode a user ID in Django's URL-safe activation format."""
+    return urlsafe_base64_encode(force_bytes(user.pk))

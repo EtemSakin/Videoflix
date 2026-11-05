@@ -63,3 +63,59 @@ def send_activation_email(user):
         ) from error
     if sent_count != 1:
         raise EmailDeliveryError("Activation email delivery failed.")
+
+
+def build_password_reset_url(user):
+    """Build the official frontend password-reset link without logging it."""
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    query = urlencode({"uid": uid, "token": token})
+    base_url = settings.FRONTEND_BASE_URL.rstrip("/")
+    return f"{base_url}/pages/auth/confirm_password.html?{query}"
+
+
+def build_password_reset_message(user, reset_url):
+    """Render a multipart password-reset email for one recipient."""
+    text_body, html_body = render_password_reset_bodies(reset_url)
+    message = EmailMultiAlternatives(
+        "Reset your Videoflix password",
+        text_body,
+        settings.DEFAULT_FROM_EMAIL,
+        [user.email],
+    )
+    message.attach_alternative(html_body, "text/html")
+    return message
+
+
+def render_password_reset_bodies(reset_url):
+    """Render plaintext and autoescaped HTML password-reset bodies."""
+    text_context = {"reset_url": mark_safe(reset_url)}
+    text_body = render_to_string(
+        "accounts/password_reset_email.txt", text_context
+    )
+    html_body = render_to_string(
+        "accounts/password_reset_email.html", {"reset_url": reset_url}
+    )
+    return text_body, html_body
+
+
+def send_password_reset_email(user):
+    """Send a password-reset link or raise a safe delivery error."""
+    if not settings.FRONTEND_BASE_URL or not settings.DEFAULT_FROM_EMAIL:
+        raise EmailDeliveryError("Email settings are incomplete.")
+    message = build_password_reset_message(
+        user, build_password_reset_url(user)
+    )
+    deliver_password_reset_message(message)
+
+
+def deliver_password_reset_message(message):
+    """Deliver reset mail and normalize SMTP errors for the API layer."""
+    try:
+        sent_count = message.send(fail_silently=False)
+    except (OSError, SMTPException) as error:
+        raise EmailDeliveryError(
+            "Password reset email delivery failed."
+        ) from error
+    if sent_count != 1:
+        raise EmailDeliveryError("Password reset email delivery failed.")

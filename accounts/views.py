@@ -1,5 +1,7 @@
 """API views for account endpoints."""
 
+import logging
+
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
@@ -23,10 +25,15 @@ from rest_framework_simplejwt.tokens import (
     UntypedToken,
 )
 
-from accounts.emails import EmailDeliveryError, send_activation_email
+from accounts.emails import (
+    EmailDeliveryError,
+    send_activation_email,
+    send_password_reset_email,
+)
 from accounts.serializers import (
     LOGIN_ERROR,
     LoginSerializer,
+    PasswordResetRequestSerializer,
     RegistrationSerializer,
 )
 
@@ -39,6 +46,7 @@ LOGIN_ERROR_RESPONSE = {"detail": LOGIN_ERROR}
 ACTIVATION_ERROR = {"message": "Invalid or expired activation link."}
 ACTIVATION_SUCCESS = {"message": "Account successfully activated."}
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class RegistrationAPIView(APIView):
@@ -110,6 +118,26 @@ class LogoutAPIView(APIView):
         if not safely_blacklist_refresh_token(raw_refresh):
             return logout_response("Invalid refresh token.", 401)
         return logout_response("Logout successful", status.HTTP_200_OK)
+
+
+class PasswordResetRequestAPIView(APIView):
+    """Request a password-reset email without exposing account existence."""
+
+    authentication_classes = ()
+    permission_classes = (AllowAny,)
+
+    def post(self, request):
+        """Validate an email and return the generic documented response."""
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                serializer.errors, status=status.HTTP_400_BAD_REQUEST
+            )
+        request_password_reset(serializer.validated_data["email"])
+        return Response(
+            {"detail": "An email has been sent to reset your password."},
+            status=status.HTTP_200_OK,
+        )
 
 
 class AccountActivationAPIView(APIView):
@@ -293,6 +321,17 @@ def clear_auth_cookie(response, name):
         httponly=settings.JWT_COOKIE_HTTPONLY,
         samesite=settings.JWT_COOKIE_SAMESITE,
     )
+
+
+def request_password_reset(email):
+    """Send reset mail without exposing delivery failures."""
+    user = User.objects.filter(email__iexact=email, is_active=True).first()
+    if user is None:
+        return
+    try:
+        send_password_reset_email(user)
+    except EmailDeliveryError:
+        logger.error("Password reset email delivery failed.")
 
 
 def create_registered_user(serializer):
