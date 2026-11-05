@@ -1,6 +1,7 @@
 """Tests for the video catalog model."""
 
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from django.conf import settings
@@ -27,6 +28,11 @@ from rest_framework_simplejwt.tokens import AccessToken
 from videos.admin import VideoAdmin, VideoAdminForm
 from videos.cache import VIDEO_CATALOG_CACHE_KEY
 from videos.models import Video
+from videos.transcoding import (
+    HLS_PROFILES,
+    build_hls_command,
+    get_hls_profile,
+)
 from videos.validators import validate_file_name
 
 User = get_user_model()
@@ -43,6 +49,7 @@ ESCAPED_METADATA = {
     "description": "&lt;img src=x&gt;",
     "category": "&lt;b&gt;Drama&lt;/b&gt;",
 }
+RESOLUTION_HEIGHTS = (("480p", 480), ("720p", 720), ("1080p", 1080))
 
 
 def admin_form_data():
@@ -68,6 +75,42 @@ def admin_uploads(filename, thumbnail, content):
 def catalog_metadata(item):
     """Select escaped text values from a catalog response item."""
     return {field: item[field] for field in ESCAPED_METADATA}
+
+
+def hls_output_paths(directory):
+    """Return expected segment-template and playlist paths."""
+    root = Path(directory).resolve()
+    return str(root / "segment_%05d.ts"), str(root / "index.m3u8")
+
+
+class HLSCommandBuilderTests(SimpleTestCase):
+    """Verify rendition profiles and shell-safe FFmpeg arguments."""
+
+    def test_profiles_cover_official_hls_resolutions(self):
+        """Expose the three resolutions required by the assignment."""
+        self.assertEqual(set(HLS_PROFILES), {"480p", "720p", "1080p"})
+        for resolution, height in RESOLUTION_HEIGHTS:
+            with self.subTest(resolution=resolution):
+                self.assertEqual(get_hls_profile(resolution).height, height)
+
+    def test_builder_returns_argument_list_and_absolute_paths(self):
+        """Keep media paths as individual arguments with no shell string."""
+        command = build_hls_command("source;touch", "output folder", "720p")
+        source_index = command.index("-i") + 1
+        segment_index = command.index("-hls_segment_filename") + 1
+        expected_source = str(Path("source;touch").resolve())
+        self.assertEqual(command[source_index], expected_source)
+        expected_paths = hls_output_paths("output folder")
+        for actual, expected in zip(
+            (command[segment_index], command[-1]), expected_paths
+        ):
+            self.assertEqual(actual, expected)
+        self.assertIn("scale=-2:min(ih\\,720)", command)
+
+    def test_builder_rejects_unsupported_resolution(self):
+        """Reject arbitrary resolution text before forming FFmpeg options."""
+        with self.assertRaises(ValueError):
+            build_hls_command("source.mp4", "output", "720p;touch")
 
 
 class VideoModelTests(TestCase):
