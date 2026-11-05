@@ -157,12 +157,7 @@ def resolve_rendition_artifact(root, movie_id, resolution, filename):
 
 def private_manifest_response(media_file):
     """Return an HLS MIME response with private cache protections."""
-    response = FileResponse(
-        media_file, content_type=HLS_MANIFEST_CONTENT_TYPE
-    )
-    response["Cache-Control"] = "private, no-store"
-    response["X-Content-Type-Options"] = "nosniff"
-    return response
+    return private_hls_response(media_file, HLS_MANIFEST_CONTENT_TYPE)
 
 
 def segment_response(movie_id, resolution, segment):
@@ -174,7 +169,12 @@ def segment_response(movie_id, resolution, segment):
         media_file = segment_path.open("rb")
     except OSError:
         return Response(status=404)
-    response = FileResponse(media_file, content_type=HLS_SEGMENT_CONTENT_TYPE)
+    return private_hls_response(media_file, HLS_SEGMENT_CONTENT_TYPE)
+
+
+def private_hls_response(media_file, content_type):
+    """Stream private HLS bytes without allowing shared cache storage."""
+    response = FileResponse(media_file, content_type=content_type)
     response["Cache-Control"] = "private, no-store"
     response["X-Content-Type-Options"] = "nosniff"
     return response

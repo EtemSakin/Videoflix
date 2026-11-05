@@ -734,6 +734,7 @@ class VideoListAPITests(APITestCase):
         Video.objects.filter(pk=newer.pk).update(created_at=now)
         response = self.client.get(reverse("video_list"))
         self.assert_catalog_response(response, [newer.pk, older.pk])
+        self.assertEqual(response["Cache-Control"], "private, no-store")
         self.assertIsNone(response.data[0]["thumbnail_url"])
 
     def test_catalog_escapes_metadata_before_frontend_html_insertion(self):
@@ -828,6 +829,8 @@ def assert_private_file_response(test_case, response, content_type, cache):
     test_case.assertEqual(response["Content-Type"], content_type)
     test_case.assertEqual(response["Cache-Control"], cache)
     test_case.assertEqual(response["X-Content-Type-Options"], "nosniff")
+    test_case.assertTrue(response.streaming)
+    test_case.assertTrue(response.has_header("Content-Length"))
 
 
 def assert_manifest_response(test_case, response):
