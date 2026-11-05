@@ -6,11 +6,17 @@ from accounts.views import (
     AccountActivationAPIView,
     LoginAPIView,
     RegistrationAPIView,
+    TokenRefreshAPIView,
 )
 
 urlpatterns = [
     path("register/", RegistrationAPIView.as_view(), name="register"),
     path("login/", LoginAPIView.as_view(), name="login"),
+    path(
+        "token/refresh/",
+        TokenRefreshAPIView.as_view(),
+        name="token_refresh",
+    ),
     path(
         "activate/<str:uidb64>/<str:token>/",
         AccountActivationAPIView.as_view(),

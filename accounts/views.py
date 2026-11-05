@@ -7,10 +7,21 @@ from django.db import IntegrityError, transaction
 from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
 from rest_framework import status
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from rest_framework_simplejwt.token_blacklist.models import (
+    BlacklistedToken,
+    OutstandingToken,
+)
+from rest_framework_simplejwt.tokens import (
+    AccessToken,
+    RefreshToken,
+    UntypedToken,
+)
 
 from accounts.emails import EmailDeliveryError, send_activation_email
 from accounts.serializers import (
@@ -66,6 +77,23 @@ class LoginAPIView(APIView):
                 LOGIN_ERROR_RESPONSE, status=status.HTTP_400_BAD_REQUEST
             )
         return login_success_response(serializer.validated_data["user"])
+
+
+class TokenRefreshAPIView(APIView):
+    """Rotate a refresh cookie and issue a new access-token cookie."""
+
+    authentication_classes = ()
+    permission_classes = (AllowAny,)
+
+    def post(self, request):
+        """Refresh tokens without returning bearer tokens in JSON."""
+        raw_refresh = request.COOKIES.get(settings.JWT_REFRESH_COOKIE_NAME)
+        if not raw_refresh:
+            return refresh_error_response("Refresh token is required.", 400)
+        tokens = safely_rotate_refresh_token(raw_refresh)
+        if tokens is None:
+            return refresh_error_response("Invalid refresh token.", 401)
+        return refresh_success_response(tokens)
 
 
 class AccountActivationAPIView(APIView):
@@ -141,6 +169,65 @@ def set_auth_cookie(response, name, token):
         samesite=settings.JWT_COOKIE_SAMESITE,
         path=settings.JWT_COOKIE_PATH,
     )
+
+
+def rotate_refresh_token(raw_refresh):
+    """Lock and rotate an unblacklisted refresh token once."""
+    with transaction.atomic():
+        token = UntypedToken(raw_refresh)
+        outstanding = OutstandingToken.objects.select_for_update().get(
+            jti=token["jti"]
+        )
+        if BlacklistedToken.objects.filter(token=outstanding).exists():
+            raise TokenError("Refresh token has already been used.")
+        serializer = TokenRefreshSerializer(data={"refresh": raw_refresh})
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data
+
+
+def safely_rotate_refresh_token(raw_refresh):
+    """Return no token data for invalid, expired, or inactive refreshes."""
+    try:
+        return rotate_refresh_token(raw_refresh)
+    except (
+        TokenError,
+        AuthenticationFailed,
+        User.DoesNotExist,
+        OutstandingToken.DoesNotExist,
+    ):
+        return None
+
+
+def refresh_error_response(detail, status_code):
+    """Return a non-cacheable refresh error without exposing token data."""
+    response = Response({"detail": detail}, status=status_code)
+    response["Cache-Control"] = "no-store"
+    return response
+
+
+def refresh_success_response(tokens):
+    """Set rotated token cookies and return the documented safe response."""
+    response = Response(
+        {"detail": "Token refreshed"}, status=status.HTTP_200_OK
+    )
+    response["Cache-Control"] = "no-store"
+    set_refreshed_cookies(response, tokens)
+    return response
+
+
+def set_refreshed_cookies(response, tokens):
+    """Set the new access cookie and any rotated refresh cookie."""
+    set_auth_cookie(
+        response,
+        settings.JWT_ACCESS_COOKIE_NAME,
+        AccessToken(tokens["access"]),
+    )
+    if "refresh" in tokens:
+        set_auth_cookie(
+            response,
+            settings.JWT_REFRESH_COOKIE_NAME,
+            RefreshToken(tokens["refresh"]),
+        )
 
 
 def create_registered_user(serializer):

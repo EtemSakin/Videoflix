@@ -30,6 +30,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.test import APIClient, APIRequestFactory, APITestCase
 from rest_framework.views import APIView
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
 from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 
 from accounts.admin import EmailUserCreationForm
@@ -739,3 +740,138 @@ class CookieJWTAuthenticationTests(APITestCase):
         User.objects.filter(pk=self.user.pk).delete()
         response = self.request_with_cookie(self.access_token)
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class TokenRefreshEndpointTests(APITestCase):
+    """Verify refresh-cookie rotation and safe endpoint responses."""
+
+    def setUp(self):
+        """Create an active user and a refresh token for API tests."""
+        self.user = User.objects.create_user(
+            "refresh@example.com", "StrongPass!73"
+        )
+        self.refresh = RefreshToken.for_user(self.user)
+        self.raw_refresh = str(self.refresh)
+        self.url = reverse("token_refresh")
+        self.client.defaults["HTTP_ORIGIN"] = "http://127.0.0.1:5500"
+
+    def submit_refresh(self, token=None):
+        """Post with the chosen token in the configured refresh cookie."""
+        value = self.raw_refresh if token is None else token
+        self.client.cookies[settings.JWT_REFRESH_COOKIE_NAME] = value
+        return self.client.post(self.url, {}, format="json")
+
+    def test_valid_refresh_sets_rotated_httponly_cookies(self):
+        """Return 200, rotate both cookies, and hide tokens from the body."""
+        response = self.submit_refresh()
+        access = response.cookies[settings.JWT_ACCESS_COOKIE_NAME]
+        refresh = response.cookies[settings.JWT_REFRESH_COOKIE_NAME]
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {"detail": "Token refreshed"})
+        self.assertTrue(access["httponly"])
+        self.assertTrue(refresh["httponly"])
+        self.assertNotEqual(refresh.value, self.raw_refresh)
+        self.assertTrue(
+            BlacklistedToken.objects.filter(token__jti=self.refresh["jti"])
+            .exists()
+        )
+
+    def test_missing_refresh_cookie_returns_400(self):
+        """Return 400 when the request has no refresh cookie."""
+        response = self.client.post(self.url, {}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_refresh_cookie_returns_401(self):
+        """Reject malformed refresh-cookie values with 401."""
+        response = self.submit_refresh("malformed-token")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_access_token_is_not_accepted_as_a_refresh_token(self):
+        """Reject access JWTs supplied in the refresh-cookie slot."""
+        access = str(self.refresh.access_token)
+        response = self.submit_refresh(access)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_expired_refresh_cookie_returns_401(self):
+        """Reject expired refresh tokens without issuing cookies."""
+        expired = RefreshToken.for_user(self.user)
+        expired.set_exp(lifetime=timedelta(seconds=-1))
+        response = self.submit_refresh(str(expired))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_inactive_user_cannot_refresh(self):
+        """Reject refresh tokens after their account has been disabled."""
+        User.objects.filter(pk=self.user.pk).update(is_active=False)
+        response = self.submit_refresh()
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_deleted_user_cannot_refresh(self):
+        """Handle deleted token owners as invalid instead of a server error."""
+        User.objects.filter(pk=self.user.pk).delete()
+        response = self.submit_refresh()
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_rotated_refresh_token_cannot_be_replayed(self):
+        """Reject a refresh token that has already been rotated."""
+        first = self.submit_refresh()
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        response = self.submit_refresh(self.raw_refresh)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class ConcurrentTokenRefreshTests(TransactionTestCase):
+    """Verify concurrent requests cannot rotate a token more than once."""
+
+    def setUp(self):
+        """Create a user, its outstanding refresh token, and endpoint URL."""
+        self.user = User.objects.create_user(
+            "parallel-refresh@example.com", "StrongPass!73"
+        )
+        self.refresh = str(RefreshToken.for_user(self.user))
+        self.url = reverse("token_refresh")
+
+    @staticmethod
+    def refresh_after_barrier(url, token, barrier):
+        """Submit a refresh from a fresh synchronized PostgreSQL connection."""
+        close_old_connections()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                backend_pid = cursor.fetchone()[0]
+            barrier.wait(timeout=10)
+            response = submit_refresh_request(url, token)
+            return response.status_code, backend_pid
+        finally:
+            connections.close_all()
+
+    def run_parallel_refreshes(self):
+        """Run two simultaneous requests using one refresh token."""
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            return list(
+                executor.map(
+                    lambda _: self.refresh_after_barrier(
+                        self.url, self.refresh, barrier
+                    ),
+                    range(2),
+                )
+            )
+
+    def test_only_one_parallel_refresh_succeeds(self):
+        """Allow only one of two simultaneous uses of the same token."""
+        results = self.run_parallel_refreshes()
+        statuses, backend_pids = zip(*results)
+        self.assertCountEqual(statuses, [200, 401])
+        self.assertEqual(len(set(backend_pids)), 2)
+
+
+def submit_refresh_request(url, token):
+    """Send one browser-compatible refresh request with the given cookie."""
+    client = APIClient()
+    client.cookies[settings.JWT_REFRESH_COOKIE_NAME] = token
+    return client.post(
+        url,
+        {},
+        format="json",
+        HTTP_ORIGIN="http://127.0.0.1:5500",
+    )
