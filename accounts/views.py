@@ -1,6 +1,10 @@
 """API views for account endpoints."""
 
+from django.contrib.auth import get_user_model
+from django.contrib.auth.tokens import default_token_generator
 from django.db import IntegrityError, transaction
+from django.utils.encoding import force_str
+from django.utils.http import urlsafe_base64_decode
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -14,12 +18,15 @@ EMAIL_UNIQUE_CONSTRAINTS = {
     "accounts_user_email_key",
 }
 REGISTRATION_ERROR = {"detail": "Registration could not be completed."}
+ACTIVATION_ERROR = {"message": "Invalid or expired activation link."}
+ACTIVATION_SUCCESS = {"message": "Account successfully activated."}
+User = get_user_model()
 
 
 class RegistrationAPIView(APIView):
     """Register an inactive user and send an activation email."""
 
-    permission_classes = [AllowAny]
+    permission_classes = (AllowAny,)
 
     def post(self, request):
         """Validate the request and return a safe registration result."""
@@ -33,6 +40,45 @@ class RegistrationAPIView(APIView):
         except EmailDeliveryError:
             return email_error_response()
         return registration_success_response(user)
+
+
+class AccountActivationAPIView(APIView):
+    """Activate an inactive account through its emailed one-time link."""
+
+    permission_classes = (AllowAny,)
+
+    def get(self, request, uidb64, token):
+        """Validate the activation link and activate its account once."""
+        uid = decode_activation_uid(uidb64)
+        if uid is None or not activate_user(uid, token):
+            return Response(
+                ACTIVATION_ERROR, status=status.HTTP_400_BAD_REQUEST
+            )
+        return Response(ACTIVATION_SUCCESS, status=status.HTTP_200_OK)
+
+
+def decode_activation_uid(uidb64):
+    """Decode an activation UID, returning None when it is malformed."""
+    try:
+        return force_str(urlsafe_base64_decode(uidb64))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def activate_user(uid, token):
+    """Lock, validate, and activate a user in one database transaction."""
+    try:
+        with transaction.atomic():
+            user = User.objects.select_for_update().get(pk=uid)
+            if user.is_active or not default_token_generator.check_token(
+                user, token
+            ):
+                return False
+            user.is_active = True
+            user.save(update_fields=("is_active",))
+    except (User.DoesNotExist, TypeError, ValueError, OverflowError):
+        return False
+    return True
 
 
 def create_registered_user(serializer):

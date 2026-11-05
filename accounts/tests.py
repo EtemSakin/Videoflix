@@ -1,6 +1,9 @@
 """Tests for email-based users and Django Admin integration."""
 
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from smtplib import SMTPException
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -10,15 +13,22 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
-from django.db import IntegrityError, transaction
-from django.test import TestCase, override_settings
+from django.db import (
+    IntegrityError,
+    close_old_connections,
+    connection,
+    connections,
+    transaction,
+)
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
 from accounts.admin import EmailUserCreationForm
+from accounts.emails import build_activation_url
 from accounts.serializers import RegistrationSerializer
 
 User = get_user_model()
@@ -342,3 +352,134 @@ class RegistrationEndpointTests(APITestCase):
         with patch("accounts.views.create_registered_user", side_effect=error):
             response = self.submit_registration()
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class AccountActivationTests(APITestCase):
+    """Test the public account activation endpoint."""
+
+    def setUp(self):
+        """Create an inactive account and its valid activation route."""
+        self.user = User.objects.create_user(
+            "activate@example.com", "StrongPass!73", is_active=False
+        )
+        self.uid = urlsafe_base64_encode(force_bytes(self.user.pk))
+        self.token = default_token_generator.make_token(self.user)
+        self.url = self.path_for_token(self.token)
+
+    def path_for_token(self, token, uid=None):
+        """Build the official activation API path for a token and UID."""
+        return reverse(
+            "activate", kwargs={"uidb64": uid or self.uid, "token": token}
+        )
+
+    def test_anonymous_activation_succeeds_with_exact_response(self):
+        """Allow anonymous activation and return the official success body."""
+        response = self.client.get(self.url)
+        self.user.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(), {"message": "Account successfully activated."}
+        )
+        self.assertTrue(self.user.is_active)
+
+    def test_malformed_uid_returns_generic_bad_request(self):
+        """Reject a malformed encoded UID without exposing account details."""
+        path = self.path_for_token(self.token, "not-base64!")
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.json(), {"message": "Invalid or expired activation link."}
+        )
+
+    def test_unknown_uid_returns_generic_bad_request(self):
+        """Reject a well-formed UID that does not identify an account."""
+        uid = urlsafe_base64_encode(force_bytes(999999))
+        response = self.client.get(self.path_for_token(self.token, uid))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_token_returns_generic_bad_request(self):
+        """Reject a manipulated activation token."""
+        response = self.client.get(self.path_for_token("not-a-valid-token"))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @override_settings(PASSWORD_RESET_TIMEOUT=60)
+    def test_expired_token_returns_generic_bad_request(self):
+        """Reject a token generated outside Django's configured timeout."""
+        expired_at = datetime.now() - timedelta(minutes=2)
+        with patch.object(
+            default_token_generator, "_now", return_value=expired_at
+        ):
+            token = default_token_generator.make_token(self.user)
+        response = self.client.get(self.path_for_token(token))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_already_active_account_is_rejected(self):
+        """Reject activation when the account is already active."""
+        User.objects.filter(pk=self.user.pk).update(is_active=True)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_activation_link_cannot_be_reused(self):
+        """Allow exactly one successful use of an activation link."""
+        first_response = self.client.get(self.url)
+        second_response = self.client.get(self.url)
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            second_response.status_code, status.HTTP_400_BAD_REQUEST
+        )
+
+    @override_settings(FRONTEND_BASE_URL="http://127.0.0.1:5500")
+    def test_commit_five_frontend_link_activates_account(self):
+        """Accept UID and token from the registration email frontend link."""
+        link = build_activation_url(self.user)
+        params = parse_qs(urlparse(link).query)
+        path = self.path_for_token(params["token"][0], params["uid"][0])
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(), {"message": "Account successfully activated."}
+        )
+
+
+class ConcurrentAccountActivationTests(TransactionTestCase):
+    """Verify row locking across independent PostgreSQL connections."""
+
+    def setUp(self):
+        """Create one inactive user and a valid token for both requests."""
+        self.user = User.objects.create_user(
+            "parallel@example.com", "StrongPass!73", is_active=False
+        )
+        self.uid = urlsafe_base64_encode(force_bytes(self.user.pk))
+        self.token = default_token_generator.make_token(self.user)
+        self.url = reverse(
+            "activate", kwargs={"uidb64": self.uid, "token": self.token}
+        )
+
+    @staticmethod
+    def activate_after_barrier(url, barrier):
+        """Issue a synchronized activation request on a fresh connection."""
+        close_old_connections()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                backend_pid = cursor.fetchone()[0]
+            barrier.wait(timeout=10)
+            response = APIClient().get(url)
+            return response.status_code, backend_pid
+        finally:
+            connections.close_all()
+
+    def test_only_one_parallel_activation_succeeds(self):
+        """Serialize concurrent activation and allow exactly one success."""
+        barrier = Barrier(2)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(
+                    lambda _: self.activate_after_barrier(self.url, barrier),
+                    range(2),
+                )
+            )
+        statuses, backend_pids = zip(*results)
+        self.assertCountEqual(statuses, [200, 400])
+        self.assertEqual(len(set(backend_pids)), 2)
+        self.assertTrue(User.objects.get(pk=self.user.pk).is_active)
