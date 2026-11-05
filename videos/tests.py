@@ -1,5 +1,7 @@
 """Tests for the video catalog model."""
 
+from datetime import timedelta
+
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
@@ -10,12 +12,24 @@ from django.test import (
     TestCase,
     override_settings,
 )
-from django.urls import Resolver404, resolve
+from django.urls import Resolver404, resolve, reverse
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APIClient, APITestCase
+from rest_framework_simplejwt.tokens import AccessToken
 
 from videos.admin import VideoAdmin, VideoAdminForm
 from videos.models import Video
 
 User = get_user_model()
+VIDEO_RESPONSE_FIELDS = {
+    "id",
+    "created_at",
+    "title",
+    "description",
+    "thumbnail_url",
+    "category",
+}
 
 
 class VideoModelTests(TestCase):
@@ -147,3 +161,80 @@ class PrivateMediaStorageTests(SimpleTestCase):
         """Set restrictive file and directory permissions on Unix hosts."""
         self.assertEqual(settings.FILE_UPLOAD_PERMISSIONS, 0o640)
         self.assertEqual(settings.FILE_UPLOAD_DIRECTORY_PERMISSIONS, 0o750)
+
+
+class VideoListAPITests(APITestCase):
+    """Verify the authenticated catalog response contract."""
+
+    def setUp(self):
+        """Authenticate a browser-style client with an access cookie."""
+        user = User.objects.create_user(
+            "catalog@example.com", "StrongPass!73"
+        )
+        token = str(AccessToken.for_user(user))
+        self.client.cookies[settings.JWT_ACCESS_COOKIE_NAME] = token
+
+    def create_video(self, title, status_value, **overrides):
+        """Create a video row with a referenced source file."""
+        values = {
+            "title": title,
+            "description": "Catalog description",
+            "category": "Drama",
+            "video_file": "videos/source/sample.mp4",
+            "status": status_value,
+        }
+        values.update(overrides)
+        return Video.objects.create(**values)
+
+    def assert_catalog_response(self, response, expected_ids):
+        """Assert the documented JSON array and its exact field names."""
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual([item["id"] for item in response.data], expected_ids)
+        self.assertEqual(set(response.data[0]), VIDEO_RESPONSE_FIELDS)
+
+    def assert_thumbnail_url_is_routable(self, video):
+        """Return the protected route in the API field for stored images."""
+        response = self.client.get(reverse("video_list"))
+        expected = f"/api/video/{video.pk}/thumbnail/"
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data[0]["thumbnail_url"].endswith(expected))
+
+    def test_catalog_requires_authentication(self):
+        """Require a valid access cookie for the official video endpoint."""
+        response = APIClient().get(reverse("video_list"))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_catalog_returns_ready_items_newest_first_as_an_array(self):
+        """Return the six documented fields and hide unfinished videos."""
+        older = self.create_video("Older", Video.STATUS_READY)
+        newer = self.create_video("Newer", Video.STATUS_READY)
+        self.create_video("Pending", Video.STATUS_PENDING)
+        now = timezone.now()
+        Video.objects.filter(pk=older.pk).update(
+            created_at=now - timedelta(days=1)
+        )
+        Video.objects.filter(pk=newer.pk).update(created_at=now)
+        response = self.client.get(reverse("video_list"))
+        self.assert_catalog_response(response, [newer.pk, older.pk])
+        self.assertIsNone(response.data[0]["thumbnail_url"])
+
+    def test_missing_thumbnail_file_returns_404_without_breaking_catalog(self):
+        """Keep missing disk assets from causing server errors."""
+        video = self.create_video(
+            "Ready",
+            Video.STATUS_READY,
+            thumbnail="videos/thumbnails/missing.jpg",
+        )
+        self.assert_thumbnail_url_is_routable(video)
+        response = self.client.get(
+            reverse("video_thumbnail", kwargs={"video_id": video.pk})
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_thumbnail_route_requires_authentication(self):
+        """Keep thumbnail files behind the same cookie authentication."""
+        video = self.create_video("Ready", Video.STATUS_READY)
+        path = reverse("video_thumbnail", kwargs={"video_id": video.pk})
+        response = APIClient().get(path)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
