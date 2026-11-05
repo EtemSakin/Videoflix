@@ -1,9 +1,16 @@
 """Tests for the video catalog model."""
 
+from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import RequestFactory, TestCase, override_settings
+from django.test import (
+    RequestFactory,
+    SimpleTestCase,
+    TestCase,
+    override_settings,
+)
+from django.urls import Resolver404, resolve
 
 from videos.admin import VideoAdmin, VideoAdminForm
 from videos.models import Video
@@ -117,3 +124,26 @@ class VideoAdminTests(TestCase):
         form = self.admin_form("sample.mp4", content=b"larger")
         self.assertFalse(form.is_valid())
         self.assertIn("video_file", form.errors)
+
+
+class PrivateMediaStorageTests(SimpleTestCase):
+    """Verify media paths are separated and not publicly routed."""
+
+    def test_source_thumbnail_and_hls_directories_use_media_root(self):
+        """Keep generated assets under the configured media volume."""
+        root = settings.MEDIA_ROOT
+        self.assertEqual(settings.VIDEO_SOURCE_ROOT, root / "videos/source")
+        self.assertEqual(
+            settings.VIDEO_THUMBNAIL_ROOT, root / "videos/thumbnails"
+        )
+        self.assertEqual(settings.VIDEO_HLS_ROOT, root / "videos/hls")
+
+    def test_media_url_has_no_public_url_pattern(self):
+        """Avoid bypassing authenticated media endpoints with static URLs."""
+        with self.assertRaises(Resolver404):
+            resolve("/media/videos/hls/1/480p/index.m3u8")
+
+    def test_uploaded_media_receives_restricted_file_permissions(self):
+        """Set restrictive file and directory permissions on Unix hosts."""
+        self.assertEqual(settings.FILE_UPLOAD_PERMISSIONS, 0o640)
+        self.assertEqual(settings.FILE_UPLOAD_DIRECTORY_PERMISSIONS, 0o750)

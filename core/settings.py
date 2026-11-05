@@ -196,6 +196,13 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
+MEDIA_URL = "/media/"
+MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", str(BASE_DIR / "media")))
+VIDEO_SOURCE_ROOT = MEDIA_ROOT / "videos" / "source"
+VIDEO_THUMBNAIL_ROOT = MEDIA_ROOT / "videos" / "thumbnails"
+VIDEO_HLS_ROOT = MEDIA_ROOT / "videos" / "hls"
+FILE_UPLOAD_PERMISSIONS = 0o640
+FILE_UPLOAD_DIRECTORY_PERMISSIONS = 0o750
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 SESSION_COOKIE_SECURE = not DEBUG
