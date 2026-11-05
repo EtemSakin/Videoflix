@@ -1,6 +1,8 @@
 """Background jobs and queue submission for video processing."""
 
 import logging
+import shutil
+from pathlib import Path
 
 import django_rq
 from django.conf import settings
@@ -47,13 +49,16 @@ def process_video(video_id):
 
 def complete_video_processing(video_id, source, output_root):
     """Convert media and persist thumbnail and processing status."""
+    outputs = []
     try:
         outputs = convert_video(source, output_root)
         attach_video_thumbnail(video_id, source)
     except Exception:
+        cleanup_hls_outputs(outputs, output_root)
         mark_processing_failed(video_id)
         raise
     if not mark_processing_ready(video_id):
+        cleanup_hls_outputs(outputs, output_root)
         raise RuntimeError("Video processing state changed unexpectedly.")
     return outputs
 
@@ -71,10 +76,38 @@ def claim_video_processing(video_id):
 
 def convert_video(source, output_root):
     """Generate all configured HLS profiles for a claimed video."""
-    return [
-        str(transcode_hls_rendition(source, output_root, resolution))
-        for resolution in HLS_PROFILES
-    ]
+    outputs = []
+    try:
+        for resolution in HLS_PROFILES:
+            output = transcode_hls_rendition(source, output_root, resolution)
+            outputs.append(str(output))
+    except Exception:
+        cleanup_hls_outputs(outputs, output_root)
+        raise
+    return outputs
+
+
+def cleanup_hls_outputs(outputs, output_root):
+    """Remove only completed rendition directories created by this job."""
+    root = Path(output_root).resolve()
+    for output in outputs:
+        path = Path(output)
+        if not is_owned_rendition(path, root):
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            logger.exception("Failed to remove partial HLS rendition.")
+
+
+def is_owned_rendition(path, root):
+    """Allow cleanup only for regular profile directories under this video."""
+    return (
+        path.parent.resolve() == root
+        and path.name in HLS_PROFILES
+        and not path.is_symlink()
+        and path.is_dir()
+    )
 
 
 def attach_video_thumbnail(video_id, source):

@@ -491,6 +491,53 @@ class VideoProcessingStatusTests(TestCase):
         video.refresh_from_db()
         self.assertEqual(video.status, Video.STATUS_FAILED)
 
+    def test_partial_conversion_cleanup_allows_a_retry(self):
+        """Remove completed profiles after failure so a retry can succeed."""
+        video = self.create_pending_video()
+        with TemporaryDirectory() as temporary:
+            hls_root = Path(temporary) / "hls"
+            with override_settings(VIDEO_HLS_ROOT=hls_root):
+                self.assert_partial_failure_is_cleaned(video, hls_root)
+                self.retry_failed_video(video, hls_root)
+
+    def assert_partial_failure_is_cleaned(self, video, hls_root):
+        """Verify failure status and cleanup of the first profile."""
+        with patch(
+            "videos.tasks.transcode_hls_rendition",
+            side_effect=self.fail_after_first_profile,
+        ):
+            with self.assertRaises(HLSConversionError):
+                process_video(video.pk)
+        self.assert_video_failed(video)
+        self.assertFalse((hls_root / str(video.pk) / "480p").exists())
+
+    def fail_after_first_profile(self, source, output_root, resolution):
+        """Publish one fake profile, then simulate FFmpeg failure."""
+        if resolution != "480p":
+            raise HLSConversionError("Simulated profile failure.")
+        output = Path(output_root) / resolution
+        output.mkdir(parents=True)
+        (output / "index.m3u8").write_text("#EXTM3U\n")
+        return output
+
+    def retry_failed_video(self, video, hls_root):
+        """Reset the failed row and verify all profiles can be published."""
+        Video.objects.filter(pk=video.pk).update(status=Video.STATUS_PENDING)
+        with patch(
+            "videos.tasks.transcode_hls_rendition",
+            side_effect=self.create_mock_profile,
+        ):
+            process_video(video.pk)
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_READY)
+        self.assertTrue((hls_root / str(video.pk) / "480p").is_dir())
+
+    def create_mock_profile(self, source, output_root, resolution):
+        """Create one empty rendition folder for a controlled retry test."""
+        output = Path(output_root) / resolution
+        output.mkdir(parents=True)
+        return output
+
     def test_duplicate_processing_job_skips_non_pending_video(self):
         """Avoid rerunning a job already claimed by another worker."""
         video = self.create_pending_video()
