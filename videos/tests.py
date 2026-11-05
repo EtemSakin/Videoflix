@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import django_rq
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
@@ -1011,3 +1012,128 @@ class VideoManifestAPITests(APITestCase):
             self.segment_url(video, segment, resolution=resolution)
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class VideoPipelineIntegrationTests(TransactionTestCase):
+    """Exercise upload, RQ processing, FFmpeg, and protected playback."""
+
+    def setUp(self):
+        """Use temporary media and a dedicated Redis database for RQ."""
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.media_root = Path(temporary.name) / "media"
+        self.hls_root = self.media_root / "videos" / "hls"
+        self.configure_pipeline_settings()
+        self.queue = django_rq.get_queue("default")
+        self.queue.empty()
+        self.authenticate_client()
+
+    def configure_pipeline_settings(self):
+        """Isolate media outputs and queue jobs from development services."""
+        self.enterContext(override_settings(
+            MEDIA_ROOT=self.media_root,
+            VIDEO_HLS_ROOT=self.hls_root,
+            VIDEO_THUMBNAIL_ROOT=self.media_root / "videos" / "thumbnails",
+            RQ_QUEUES={
+                "default": {
+                    "URL": "redis://redis:6379/9",
+                    "DEFAULT_TIMEOUT": 3600,
+                }
+            },
+        ))
+
+    def authenticate_client(self):
+        """Authenticate playback requests with the project's JWT cookie."""
+        user = User.objects.create_user(
+            "pipeline@example.com", "StrongPass!73"
+        )
+        token = AccessToken.for_user(user)
+        self.client = APIClient()
+        self.client.cookies[settings.JWT_ACCESS_COOKIE_NAME] = str(token)
+
+    def create_test_source(self):
+        """Generate a short H.264 source fixture with the installed FFmpeg."""
+        source = self.media_root.parent / "integration-source.mp4"
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=640x360:rate=24",
+            "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100",
+            "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", str(source),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return source
+
+    def upload_video(self, source):
+        """Submit a generated upload through the existing Django Admin save."""
+        with source.open("rb") as media_file:
+            upload = SimpleUploadedFile("sample.mp4", media_file.read())
+        video = Video(
+            title="Pipeline film", category="Drama", video_file=upload
+        )
+        VideoAdmin(Video, admin.site).save_model(None, video, None, False)
+        return video
+
+    def test_upload_runs_through_rq_ffmpeg_and_protected_hls_playback(self):
+        """Test upload conversion and private playback for all profiles."""
+        video = self.upload_video(self.create_test_source())
+        self.assertEqual(self.queue.count, 1)
+        worker = django_rq.get_worker("default")
+        self.assertTrue(worker.work(burst=True))
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_READY)
+        self.assert_video_playback(video)
+
+    def assert_video_playback(self, video):
+        """Fetch the catalog and private thumbnail, playlists, and segments."""
+        catalog = self.client.get(reverse("video_list"))
+        self.assertEqual(catalog.status_code, status.HTTP_200_OK)
+        self.assert_video_thumbnail(video)
+        for resolution in HLS_PROFILES:
+            self.assert_hls_rendition(video, resolution)
+
+    def assert_video_thumbnail(self, video):
+        """Verify FFmpeg's generated JPEG is served through the API."""
+        path = reverse("video_thumbnail", kwargs={"video_id": video.pk})
+        response = self.client.get(path)
+        assert_private_file_response(
+            self, response, "image/jpeg", "private, max-age=300"
+        )
+        thumbnail = b"".join(response.streaming_content)
+        self.assertTrue(thumbnail.startswith(b"\xff\xd8"))
+
+    def assert_hls_rendition(self, video, resolution):
+        """Fetch one authenticated manifest and its relative TS segment."""
+        path = reverse("video_manifest", kwargs={
+            "movie_id": video.pk,
+            "resolution": resolution,
+        })
+        manifest = self.client.get(path)
+        assert_private_file_response(
+            self,
+            manifest,
+            "application/vnd.apple.mpegurl",
+            "private, no-store",
+        )
+        self.assert_manifest_segment(video, resolution, manifest)
+
+    def assert_manifest_segment(self, video, resolution, manifest):
+        """Read the generated playlist and stream its referenced segment."""
+        playlist = b"".join(manifest.streaming_content).decode("utf-8")
+        segment = next(
+            line for line in playlist.splitlines() if line.endswith(".ts")
+        )
+        self.assert_segment_stream(video, resolution, segment)
+
+    def assert_segment_stream(self, video, resolution, segment):
+        """Fetch the referenced binary segment using the playback API."""
+        path = reverse("video_segment", kwargs={
+            "movie_id": video.pk,
+            "resolution": resolution,
+            "segment": segment,
+        })
+        response = self.client.get(path)
+        assert_private_file_response(
+            self, response, "video/MP2T", "private, no-store"
+        )
+        payload = b"".join(response.streaming_content)
+        self.assertTrue(payload.startswith(b"\x47"))
