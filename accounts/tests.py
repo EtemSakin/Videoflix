@@ -1036,10 +1036,10 @@ class PasswordResetRequestTests(APITestCase):
     def test_email_delivery_failure_keeps_the_generic_response(self):
         """Avoid disclosing valid accounts when SMTP delivery fails."""
         failure = patch(
-            "accounts.views.send_password_reset_email",
+            "accounts.utils.send_password_reset_email",
             side_effect=EmailDeliveryError,
         )
-        with failure, self.assertLogs("accounts.views", level="ERROR"):
+        with failure, self.assertLogs("accounts.utils", level="ERROR"):
             response = self.submit_request()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
@@ -1048,7 +1048,7 @@ class PasswordResetRequestTests(APITestCase):
         """Hide a low-level SMTP failure behind the generic API response."""
         send_path = "accounts.emails.EmailMultiAlternatives.send"
         with patch(send_path, side_effect=OSError("SMTP offline")):
-            with self.assertLogs("accounts.views", level="ERROR"):
+            with self.assertLogs("accounts.utils", level="ERROR"):
                 response = self.submit_request()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)
@@ -1058,7 +1058,7 @@ class PasswordResetRequestTests(APITestCase):
         """Treat an SMTP backend sending no reset message as a failure."""
         send_path = "accounts.emails.EmailMultiAlternatives.send"
         with patch(send_path, return_value=0):
-            with self.assertLogs("accounts.views", level="ERROR"):
+            with self.assertLogs("accounts.utils", level="ERROR"):
                 response = self.submit_request()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data, PASSWORD_RESET_RESPONSE)

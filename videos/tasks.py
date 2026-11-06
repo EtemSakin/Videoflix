@@ -9,6 +9,8 @@ from django.conf import settings
 from django.db import transaction
 from redis.exceptions import RedisError
 
+from videos.cache import invalidate_video_catalog_cache
+from videos.media_cleanup import cleanup_video_artifacts
 from videos.models import Video
 from videos.thumbnails import generate_video_thumbnail
 from videos.transcoding import HLS_PROFILES, transcode_hls_rendition
@@ -28,6 +30,7 @@ def enqueue_video_processing(video_id):
         logger.exception(
             "Failed to queue video processing for id=%s", video_id
         )
+        mark_pending_failed(video_id)
         return None
 
 
@@ -49,28 +52,69 @@ def process_video(video_id):
 
 def complete_video_processing(video_id, source, output_root):
     """Convert media and persist thumbnail and processing status."""
-    outputs = []
-    try:
-        outputs = convert_video(source, output_root)
-        attach_video_thumbnail(video_id, source)
-    except Exception:
-        cleanup_hls_outputs(outputs, output_root)
-        mark_processing_failed(video_id)
-        raise
+    outputs = process_video_outputs(video_id, source, output_root)
+    if outputs is None:
+        return []
     if not mark_processing_ready(video_id):
-        cleanup_hls_outputs(outputs, output_root)
+        deleted = handle_lost_processing_claim(
+            video_id, source, output_root, outputs
+        )
+        if deleted:
+            return []
         raise RuntimeError("Video processing state changed unexpectedly.")
     return outputs
 
 
+def process_video_outputs(video_id, source, output_root):
+    """Convert HLS files and attach the generated thumbnail safely."""
+    outputs = []
+    try:
+        outputs = convert_video(source, output_root)
+        attach_video_thumbnail(video_id, source)
+    except Video.DoesNotExist:
+        cleanup_deleted_processing(video_id, source, output_root, outputs)
+        return None
+    except Exception:
+        handle_processing_failure(video_id, source, output_root, outputs)
+        raise
+    return outputs
+
+
+def handle_processing_failure(video_id, source, output_root, outputs):
+    """Clean partial outputs and save a failed or deleted-job outcome."""
+    cleanup_hls_outputs(outputs, output_root)
+    if video_exists(video_id):
+        mark_processing_failed(video_id)
+    else:
+        cleanup_deleted_video(video_id, source)
+
+
+def handle_lost_processing_claim(video_id, source, output_root, outputs):
+    """Remove generated files when a worker loses its database claim."""
+    cleanup_hls_outputs(outputs, output_root)
+    if video_exists(video_id):
+        return False
+    cleanup_deleted_video(video_id, source)
+    return True
+
+
+def cleanup_deleted_processing(video_id, source, output_root, outputs):
+    """Finish an intentionally deleted video job without an RQ failure."""
+    cleanup_hls_outputs(outputs, output_root)
+    cleanup_deleted_video(video_id, source)
+
+
 def claim_video_processing(video_id):
     """Atomically claim pending work so duplicate RQ jobs cannot transcode."""
-    with transaction.atomic():
-        video = Video.objects.select_for_update().get(pk=video_id)
-        if video.status != Video.STATUS_PENDING:
-            return None
-        video.status = Video.STATUS_PROCESSING
-        video.save(update_fields=("status",))
+    try:
+        with transaction.atomic():
+            video = Video.objects.select_for_update().get(pk=video_id)
+            if video.status != Video.STATUS_PENDING:
+                return None
+            video.status = Video.STATUS_PROCESSING
+            video.save(update_fields=("status",))
+    except Video.DoesNotExist:
+        return None
     return video.video_file.path, settings.VIDEO_HLS_ROOT / str(video.pk)
 
 
@@ -112,9 +156,31 @@ def is_owned_rendition(path, root):
 
 def attach_video_thumbnail(video_id, source):
     """Store the generated private thumbnail on its catalog row."""
-    video = Video.objects.get(pk=video_id)
-    video.thumbnail.name = generate_video_thumbnail(source, video_id)
-    video.save(update_fields=("thumbnail",))
+    Video.objects.get(pk=video_id)
+    name = generate_video_thumbnail(source, video_id)
+    updated = Video.objects.filter(
+        pk=video_id, status=Video.STATUS_PROCESSING
+    ).update(thumbnail=name)
+    if not updated:
+        raise Video.DoesNotExist
+    transaction.on_commit(invalidate_video_catalog_cache)
+
+
+def video_exists(video_id):
+    """Return whether a worker's catalog row still exists."""
+    return Video.objects.filter(pk=video_id).exists()
+
+
+def cleanup_deleted_video(video_id, source):
+    """Finish cleanup after a running worker releases deleted media."""
+    try:
+        source_name = Path(source).resolve().relative_to(
+            Path(settings.MEDIA_ROOT).resolve()
+        ).as_posix()
+    except (OSError, ValueError):
+        source_name = None
+    thumbnail_name = f"videos/thumbnails/{video_id}/thumbnail.jpg"
+    cleanup_video_artifacts(video_id, source_name, thumbnail_name)
 
 
 def update_video_status(video_id, expected_status, new_status):
@@ -133,6 +199,11 @@ def update_video_status(video_id, expected_status, new_status):
 def mark_processing_failed(video_id):
     """Mark active work as failed after conversion raises an error."""
     update_video_status(video_id, Video.STATUS_PROCESSING, Video.STATUS_FAILED)
+
+
+def mark_pending_failed(video_id):
+    """Mark queue submission failures so they cannot look pending forever."""
+    update_video_status(video_id, Video.STATUS_PENDING, Video.STATUS_FAILED)
 
 
 def mark_processing_ready(video_id):

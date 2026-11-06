@@ -8,6 +8,7 @@ from functools import partial
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import django_rq
@@ -36,8 +37,11 @@ from rest_framework_simplejwt.tokens import AccessToken
 
 from videos.admin import VideoAdmin, VideoAdminForm
 from videos.cache import VIDEO_CATALOG_CACHE_KEY
+from videos.media_cleanup import cleanup_video_artifacts
 from videos.models import Video
 from videos.tasks import (
+    cleanup_deleted_video,
+    complete_video_processing,
     enqueue_video_processing,
     process_video,
     update_video_status,
@@ -74,6 +78,115 @@ ESCAPED_METADATA = {
 RESOLUTION_HEIGHTS = (("480p", 480), ("720p", 720), ("1080p", 1080))
 
 
+def media_settings(media_root):
+    """Return isolated media roots used by file lifecycle regression tests."""
+    videos_root = media_root / "videos"
+    return {
+        "MEDIA_ROOT": media_root,
+        "VIDEO_SOURCE_ROOT": videos_root / "source",
+        "VIDEO_THUMBNAIL_ROOT": videos_root / "thumbnails",
+        "VIDEO_HLS_ROOT": videos_root / "hls",
+    }
+
+
+def write_test_media(media_root, relative_name):
+    """Write a small managed file and return its absolute filesystem path."""
+    path = media_root / relative_name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"media")
+    return path
+
+
+def replacement_fixture(media_root):
+    """Create an already processed video with old and replacement sources."""
+    video = Video.objects.create(
+        title="Original metadata",
+        category="Drama",
+        video_file="videos/source/old.mp4",
+        status=Video.STATUS_READY,
+    )
+    return build_replacement_media(media_root, video)
+
+
+def build_replacement_media(media_root, video):
+    """Attach previous and replacement files to a ready video fixture."""
+    old_source = write_test_media(media_root, video.video_file.name)
+    thumbnail_name = f"videos/thumbnails/{video.pk}/thumbnail.jpg"
+    video.thumbnail.name = thumbnail_name
+    video.save(update_fields=("thumbnail",))
+    thumbnail = write_test_media(media_root, thumbnail_name)
+    hls = write_test_media(
+        media_root, f"videos/hls/{video.pk}/480p/index.m3u8"
+    )
+    new_source = write_test_media(media_root, "videos/source/new.mp4")
+    rename_test_source(video, new_source)
+    video.title = "Edited metadata"
+    return video, old_source, thumbnail, hls
+
+
+def rename_test_source(video, new_source):
+    """Assign an already stored replacement path to a model instance."""
+    video.video_file.name = new_source.relative_to(
+        settings.MEDIA_ROOT
+    ).as_posix()
+
+
+def deletion_fixture(media_root, status_value=Video.STATUS_READY):
+    """Create a video plus the three managed media artifact types."""
+    video = Video.objects.create(
+        title="Delete film",
+        category="Drama",
+        video_file="videos/source/delete.mp4",
+        status=status_value,
+    )
+    return build_deletion_media(media_root, video)
+
+
+def build_deletion_media(media_root, video):
+    """Create source, thumbnail, and HLS files for a saved video row."""
+    video.thumbnail.name = f"videos/thumbnails/{video.pk}/thumbnail.jpg"
+    video.save(update_fields=("thumbnail",))
+    source = write_test_media(media_root, video.video_file.name)
+    thumbnail = write_test_media(media_root, video.thumbnail.name)
+    hls = write_test_media(
+        media_root, f"videos/hls/{video.pk}/480p/index.m3u8"
+    )
+    return video, source, thumbnail, hls
+
+
+def processing_fixture(media_root):
+    """Create a processing video and its source for worker delete tests."""
+    video = Video.objects.create(
+        title="Processing delete",
+        category="Drama",
+        video_file="videos/source/processing-delete.mp4",
+        status=Video.STATUS_PROCESSING,
+    )
+    source = write_test_media(media_root, video.video_file.name)
+    return video, source
+
+
+def symlink_fixture(media_root):
+    """Create a managed symlink and a file beneath an external storage root."""
+    source_root = media_root / "videos" / "source"
+    source_root.mkdir(parents=True)
+    external = media_root.parent / f"{media_root.name}-external.mp4"
+    external.write_bytes(b"keep")
+    link = source_root / "linked.mp4"
+    link.symlink_to(external)
+    external_root = media_root.parent / f"{media_root.name}-external-root"
+    write_test_media(external_root, "outside.mp4")
+    return external, link, external_root
+
+
+def delete_during_transcode(video, root, resolution):
+    """Publish one fake rendition and delete the row on the first call."""
+    output = Path(root) / resolution
+    output.mkdir(parents=True, exist_ok=True)
+    Video.objects.filter(pk=video.pk).delete()
+    return output
+
+
 def admin_form_data():
     """Return valid metadata for admin form tests."""
     return {
@@ -93,6 +206,16 @@ def new_admin_video():
         video_file=SimpleUploadedFile(
             "source.mp4", b"\x00\x00\x00\x18ftypisom"
         ),
+    )
+
+
+def create_failed_admin_video():
+    """Create a failed row suitable for testing the admin retry action."""
+    return Video.objects.create(
+        title="Retry film",
+        category="Drama",
+        video_file="videos/source/retry.mp4",
+        status=Video.STATUS_FAILED,
     )
 
 
@@ -407,6 +530,21 @@ class VideoQueueTests(TestCase):
             ):
                 self.assertIsNone(enqueue_video_processing(27))
 
+    def test_queue_unavailability_marks_pending_video_failed(self):
+        """Make failed queue submission visible and eligible for retry."""
+        video = Video.objects.create(
+            title="Queue failure",
+            category="Drama",
+            video_file="videos/source/queue-failure.mp4",
+        )
+        with self.assertLogs("videos.tasks", level="ERROR"):
+            with patch(
+                "videos.tasks.django_rq.get_queue", side_effect=RedisError
+            ):
+                self.assertIsNone(enqueue_video_processing(video.pk))
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_FAILED)
+
     def test_processing_task_enqueues_each_supported_rendition(self):
         """Process one row through every configured HLS profile."""
         video = Video.objects.create(
@@ -471,6 +609,33 @@ class VideoProcessingStatusTests(TestCase):
                     process_video(video.pk)
         self.assert_video_failed(video)
 
+    def test_delete_during_conversion_cleans_files_and_finishes_job(self):
+        """Treat active-job deletion as a clean cancellation."""
+        with TemporaryDirectory() as temporary:
+            self.assert_deleted_processing_finishes(Path(temporary))
+
+    def assert_deleted_processing_finishes(self, media_root):
+        """Remove worker-owned output and source after an active delete."""
+        with override_settings(**media_settings(media_root)):
+            video, source = processing_fixture(media_root)
+            output_root = settings.VIDEO_HLS_ROOT / str(video.pk)
+            self.run_delete_during_conversion(video, source, output_root)
+            self.assertFalse(source.exists())
+            self.assertFalse(output_root.exists())
+
+    def run_delete_during_conversion(self, video, source, output_root):
+        """Delete the row from the transcode callback and finish the task."""
+        with patch(
+            "videos.tasks.transcode_hls_rendition",
+            side_effect=lambda _source, root, size: delete_during_transcode(
+                video, root, size
+            ),
+        ):
+            result = complete_video_processing(
+                video.pk, str(source), output_root
+            )
+        self.assertEqual(result, [])
+
     def assert_video_failed(self, video):
         """Refresh and verify a worker failure was saved to PostgreSQL."""
         video.refresh_from_db()
@@ -479,17 +644,29 @@ class VideoProcessingStatusTests(TestCase):
     def test_status_transitions_schedule_catalog_cache_invalidation(self):
         """Invalidate cached listings when processing status is saved."""
         video = self.create_pending_video()
+        clear = self.process_with_cache_tracking(video)
+        self.assertEqual(clear.call_count, 3)
+
+    def process_with_cache_tracking(self, video):
+        """Run a worker with synchronous, observable cache invalidation."""
         with patch("videos.signals.invalidate_video_catalog_cache") as clear:
-            with patch(
+            self.run_with_cache_tracking(video, clear)
+        return clear
+
+    def run_with_cache_tracking(self, video, clear):
+        """Run work with cache, commit, and transcoding boundaries patched."""
+        with (
+            patch("videos.tasks.invalidate_video_catalog_cache", clear),
+            patch(
                 "videos.tasks.transaction.on_commit",
                 side_effect=lambda callback: callback(),
-            ):
-                with patch(
-                    "videos.tasks.transcode_hls_rendition",
-                    side_effect=mock_hls_output,
-                ):
-                    process_video(video.pk)
-        self.assertEqual(clear.call_count, 3)
+            ),
+            patch(
+                "videos.tasks.transcode_hls_rendition",
+                side_effect=mock_hls_output,
+            ),
+        ):
+            process_video(video.pk)
 
     def test_conversion_failure_marks_video_failed(self):
         """Persist failure before returning the worker exception to RQ."""
@@ -688,6 +865,72 @@ class VideoAdminTests(TestCase):
             ("title", "category", "status"),
         )
 
+    def test_replacing_source_resets_processing_and_cleans_old_outputs(self):
+        """Reprocess replacements without sacrificing metadata editing."""
+        with TemporaryDirectory() as temporary:
+            self.assert_source_replacement_is_safe(Path(temporary))
+
+    def assert_source_replacement_is_safe(self, media_root):
+        """Persist a replacement, then verify cleanup and queue callbacks."""
+        settings_override = media_settings(media_root)
+        with override_settings(**settings_override):
+            self.perform_source_replacement(media_root)
+
+    def perform_source_replacement(self, media_root):
+        """Exercise admin's committed replacement callback in isolation."""
+        video, old_source, old_thumbnail, hls_output = replacement_fixture(
+            media_root
+        )
+        enqueue = self.save_and_process_replacement(video)
+        self.assert_source_replacement_result(
+            video, old_source, old_thumbnail, hls_output, enqueue
+        )
+
+    def save_and_process_replacement(self, video):
+        """Save a changed source and execute its deferred admin callback."""
+        callbacks = []
+        form = SimpleNamespace(changed_data=["video_file"])
+        with (
+            patch("videos.admin.transaction.on_commit", callbacks.append),
+            patch("videos.admin.enqueue_video_processing") as enqueue,
+        ):
+            admin.site._registry[Video].save_model(None, video, form, True)
+            for callback in callbacks:
+                callback()
+        return enqueue
+
+    def assert_source_replacement_result(
+        self, video, old_source, old_thumbnail, hls_output, enqueue
+    ):
+        """Keep the new source and metadata while deleting stale artifacts."""
+        video.refresh_from_db()
+        self.assertEqual(video.title, "Edited metadata")
+        self.assertEqual(video.status, Video.STATUS_PENDING)
+        self.assertFalse(video.thumbnail)
+        self.assertTrue(Path(video.video_file.path).is_file())
+        self.assertFalse(old_source.exists())
+        self.assertFalse(old_thumbnail.exists())
+        self.assertFalse(hls_output.parent.exists())
+        enqueue.assert_called_once_with(video.pk)
+
+    def test_retry_action_resets_failed_status_and_schedules_job(self):
+        """Expose a deliberate retry action for queue or worker failures."""
+        self.assert_failed_video_retries()
+
+    def assert_failed_video_retries(self):
+        """Verify the failed state resets before a retry reaches RQ."""
+        video = create_failed_admin_video()
+        model_admin = admin.site._registry[Video]
+        with (
+            patch("videos.admin.enqueue_video_processing") as enqueue,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            model_admin.prepare_retry(video)
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_PENDING)
+        enqueue.assert_called_once_with(video.pk)
+
+
     def test_admin_site_requires_active_staff_access(self):
         """Deny regular or inactive users access to Django Admin."""
         request = RequestFactory().get("/admin/")
@@ -758,6 +1001,118 @@ class VideoAdminTests(TestCase):
                 with self.assertRaises(ValidationError):
                     validate_file_name(filename)
 
+
+class VideoMediaCleanupTests(TestCase):
+    """Verify deletion cleanup is delayed and confined to media roots."""
+
+    def test_delete_cleanup_runs_after_commit(self):
+        """Remove source, thumbnail, and HLS only from on-commit callback."""
+        with TemporaryDirectory() as temporary:
+            self.assert_deleted_video_media_is_cleaned(Path(temporary))
+
+    def assert_deleted_video_media_is_cleaned(self, media_root):
+        """Create managed files and execute the deletion commit callback."""
+        with override_settings(**media_settings(media_root)):
+            video, source, thumbnail, hls = deletion_fixture(media_root)
+            with self.captureOnCommitCallbacks(execute=True):
+                video.delete()
+        self.assertFalse(source.exists())
+        self.assertFalse(thumbnail.exists())
+        self.assertFalse(hls.exists())
+
+    def test_processing_video_cleanup_waits_for_worker(self):
+        """Retain active job media until the worker exits."""
+        with TemporaryDirectory() as temporary:
+            self.assert_processing_delete_waits(Path(temporary))
+
+    def test_delete_reads_locked_status_after_worker_claim(self):
+        """Protect files when a stale admin row predates a worker claim."""
+        with TemporaryDirectory() as temporary:
+            self.assert_stale_delete_waits_for_worker(Path(temporary))
+
+    def assert_stale_delete_waits_for_worker(self, media_root):
+        """Refresh deletion state under lock before scheduling file cleanup."""
+        with override_settings(**media_settings(media_root)):
+            video, source, thumbnail, hls = deletion_fixture(media_root)
+            self.simulate_claim_then_delete(video)
+        self.assertTrue(source.exists())
+        self.assertTrue(thumbnail.exists())
+        self.assertTrue(hls.exists())
+
+    def simulate_claim_then_delete(self, video):
+        """Change worker status after loading a stale deletion instance."""
+        stale_video = Video.objects.get(pk=video.pk)
+        Video.objects.filter(pk=video.pk).update(
+            status=Video.STATUS_PROCESSING
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            stale_video.delete()
+
+    def assert_processing_delete_waits(self, media_root):
+        """Delete an active row, then let worker completion clean its files."""
+        with override_settings(**media_settings(media_root)):
+            video, source, thumbnail, hls = deletion_fixture(
+                media_root, Video.STATUS_PROCESSING
+            )
+            self.finish_deferred_delete(video, source, thumbnail)
+        self.assertFalse(source.exists())
+        self.assertFalse(thumbnail.exists())
+        self.assertFalse(hls.exists())
+
+    def finish_deferred_delete(self, video, source, thumbnail):
+        """Keep active media through deletion, then clean it after job end."""
+        video_id = video.pk
+        with self.captureOnCommitCallbacks(execute=True):
+            video.delete()
+        self.assertTrue(source.exists())
+        self.assertTrue(thumbnail.exists())
+        cleanup_deleted_video(video_id, source)
+
+    def test_cleanup_rejects_paths_outside_managed_root(self):
+        """Keep traversal names outside the configured source root intact."""
+        with TemporaryDirectory() as temporary:
+            self.assert_path_traversal_is_rejected(Path(temporary))
+
+    def test_cleanup_rejects_symlinks_and_roots_outside_media(self):
+        """Keep symlink targets and explicitly external storage untouched."""
+        with TemporaryDirectory() as temporary:
+            self.assert_external_media_is_preserved(Path(temporary))
+
+    def assert_external_media_is_preserved(self, media_root):
+        """Exercise symlink and root-containment checks on real files."""
+        external, link, external_root = symlink_fixture(media_root)
+        with override_settings(**media_settings(media_root)):
+            name = link.relative_to(media_root).as_posix()
+            cleanup_video_artifacts(51, name)
+            self.assert_external_storage_is_preserved(
+                media_root, external_root
+            )
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(external.exists())
+
+    def assert_external_storage_is_preserved(self, media_root, external_root):
+        """Refuse cleanup when the configured source root escapes media."""
+        overrides = media_settings(media_root)
+        overrides["VIDEO_SOURCE_ROOT"] = external_root
+        name = (Path("..") / external_root.name / "outside.mp4").as_posix()
+        with override_settings(**overrides):
+            cleanup_video_artifacts(52, name)
+        self.assertTrue((external_root / "outside.mp4").exists())
+
+    def test_cleanup_tolerates_missing_files_and_hls_roots(self):
+        """Treat already absent output as a successful cleanup state."""
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with override_settings(**media_settings(root)):
+                cleanup_video_artifacts(53, "videos/source/missing.mp4")
+
+    def assert_path_traversal_is_rejected(self, media_root):
+        """Attempt to remove a traversal target and verify it survives."""
+        outside = media_root / "outside.mp4"
+        outside.write_bytes(b"keep")
+        with override_settings(**media_settings(media_root)):
+            cleanup_video_artifacts(99, "../outside.mp4")
+        self.assertTrue(outside.exists())
 
 class PrivateMediaStorageTests(SimpleTestCase):
     """Verify media paths are separated and not publicly routed."""
