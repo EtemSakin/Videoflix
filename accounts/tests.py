@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from io import StringIO
 from smtplib import SMTPException
 from threading import Barrier
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
+from django.core.management import call_command
 from django.db import (
     IntegrityError,
     close_old_connections,
@@ -76,10 +78,12 @@ class UserManagerTests(TestCase):
         self.assertNotEqual(user.password, "StrongPass!73")
 
     def test_email_is_the_unique_login_identifier(self):
-        """Use email for authentication without a username database field."""
+        """Use email to authenticate while keeping username compatibility."""
         self.assertEqual(User.USERNAME_FIELD, "email")
-        field_names = {field.name for field in User._meta.fields}
-        self.assertNotIn("username", field_names)
+        username = User._meta.get_field("username")
+        self.assertTrue(username.null)
+        self.assertTrue(username.blank)
+        self.assertTrue(username.unique)
         user = User.objects.create_user("viewer@example.com", "StrongPass!73")
         self.assertEqual(user.get_username(), user.email)
 
@@ -93,12 +97,28 @@ class UserManagerTests(TestCase):
     def test_create_superuser_sets_required_privileges(self):
         """Give created superusers active staff and superuser flags."""
         user = User.objects.create_superuser(
-            "admin@example.com", "StrongPass!73"
+            "admin@example.com", "StrongPass!73", username="course-admin"
         )
 
         self.assertTrue(user.is_staff)
         self.assertTrue(user.is_superuser)
         self.assertTrue(user.is_active)
+        self.assertTrue(User.objects.filter(username="course-admin").exists())
+
+    def test_createsuperuser_command_accepts_course_environment(self):
+        """Create an email user from the official username environment vars."""
+        values = {
+            "DJANGO_SUPERUSER_EMAIL": "course@example.com",
+            "DJANGO_SUPERUSER_USERNAME": "course-admin",
+            "DJANGO_SUPERUSER_PASSWORD": "StrongPass!73",
+        }
+        with patch.dict("os.environ", values):
+            call_command(
+                "createsuperuser", interactive=False, stdout=StringIO()
+            )
+        user = User.objects.get(username="course-admin")
+        self.assertEqual(user.email, "course@example.com")
+        self.assertTrue(user.is_superuser)
 
     def test_create_superuser_rejects_missing_privileges(self):
         """Reject superusers missing any required privileged flag."""
@@ -125,7 +145,7 @@ class UserManagerTests(TestCase):
 
 
 class UserAdminTests(TestCase):
-    """Verify the admin works without a username field."""
+    """Keep user administration focused on email authentication."""
 
     def test_user_admin_is_registered_with_email_fields(self):
         """Register the user model with email-based admin fields."""
