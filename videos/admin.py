@@ -71,12 +71,14 @@ class VideoAdmin(admin.ModelAdmin):
     list_display = ("title", "category", "status", "created_at")
     list_filter = ("category", "status")
     search_fields = ("title", "description", "category")
-    readonly_fields = ("created_at",)
+    readonly_fields = ("created_at", "status")
     ordering = ("-created_at", "id")
     actions = ("retry_failed_processing",)
 
     def save_model(self, request, obj, form, change):
         """Queue new or replaced source media after the database commit."""
+        if change:
+            self.preserve_current_status(obj)
         old_media = self.previous_media(obj, form, change)
         should_queue = self.should_queue_video(obj, form, change)
         if old_media:
@@ -85,6 +87,13 @@ class VideoAdmin(admin.ModelAdmin):
         super().save_model(request, obj, form, change)
         if should_queue:
             self.schedule_processing(obj.pk, old_media)
+
+    def preserve_current_status(self, obj):
+        """Copy the row-locked status into a possibly stale admin object."""
+        current = Video.objects.select_for_update().only("status").get(
+            pk=obj.pk
+        )
+        obj.status = current.status
 
     def previous_media(self, obj, form, change):
         """Return prior file names when an existing source is replaced."""

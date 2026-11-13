@@ -218,6 +218,16 @@ def admin_metadata_form(video):
     return VideoAdminForm(data=data, instance=video)
 
 
+def metadata_video(status_value=Video.STATUS_PENDING):
+    """Create a video for admin status and concurrency tests."""
+    return Video.objects.create(
+        title="Metadata film",
+        category="Drama",
+        video_file="videos/source/metadata.mp4",
+        status=status_value,
+    )
+
+
 def create_processing_admin_video():
     """Create a processing row for admin form regression tests."""
     return Video.objects.create(
@@ -859,6 +869,39 @@ class VideoAdminWorkerLockTests(TransactionTestCase):
         with TemporaryDirectory() as temporary:
             self.assert_admin_lock_serializes_worker(Path(temporary))
 
+    def test_metadata_save_serializes_with_worker_claim(self):
+        """Keep a worker claim behind the admin row lock until commit."""
+        self.assert_metadata_save_serializes_worker()
+
+    def assert_metadata_save_serializes_worker(self):
+        """Observe an independent worker blocked by a metadata save."""
+        video = metadata_video()
+        form = admin_metadata_form(video)
+        started = threading.Event()
+        backend_pids = []
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            claim = self.save_metadata_while_worker_waits(
+                video, form, executor, started, backend_pids
+            )
+            claimed = claim.result(timeout=10)
+        video.refresh_from_db()
+        self.assertEqual(claimed[0], video.video_file.path)
+        self.assertEqual(video.status, Video.STATUS_PROCESSING)
+
+    def save_metadata_while_worker_waits(
+        self, video, form, executor, started, backend_pids
+    ):
+        """Lock and save metadata before the worker claims the row."""
+        with transaction.atomic():
+            self.assertTrue(form.is_valid(), form.errors)
+            obj = form.save(commit=False)
+            admin.site._registry[Video].save_model(None, obj, form, True)
+            claim = executor.submit(
+                claim_video_in_thread, video.pk, started, backend_pids
+            )
+            self.wait_until_claim_is_blocked(started, backend_pids)
+        return claim
+
     def assert_admin_lock_serializes_worker(self, media_root):
         """Hold the admin transaction while an independent claim waits."""
         with override_settings(**media_settings(media_root)):
@@ -999,6 +1042,31 @@ class VideoAdminTests(TestCase):
             model_admin.list_display[0:3],
             ("title", "category", "status"),
         )
+        self.assertIn("status", model_admin.readonly_fields)
+
+    def test_admin_form_rejects_manual_status_changes(self):
+        """Keep a forged status value out of the generated admin form."""
+        video = metadata_video(Video.STATUS_PROCESSING)
+        model_admin = admin.site._registry[Video]
+        request = RequestFactory().post("/admin/")
+        form_class = model_admin.get_form(request, obj=video)
+        form = form_class(data=admin_form_data(), instance=video)
+        self.assertNotIn("status", form.fields)
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertEqual(form.save(commit=False).status, Video.STATUS_PROCESSING)
+
+    def test_stale_admin_form_preserves_worker_status(self):
+        """Do not overwrite a status changed after the form was loaded."""
+        video = metadata_video()
+        form = admin_metadata_form(video)
+        Video.objects.filter(pk=video.pk).update(
+            status=Video.STATUS_PROCESSING
+        )
+        with transaction.atomic():
+            obj = form.save(commit=False)
+            admin.site._registry[Video].save_model(None, obj, form, True)
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_PROCESSING)
 
     def test_replacing_source_resets_processing_and_cleans_old_outputs(self):
         """Reprocess replacements without sacrificing metadata editing."""
