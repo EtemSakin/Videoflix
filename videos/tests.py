@@ -2,6 +2,7 @@
 
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from functools import partial
@@ -18,7 +19,7 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db import close_old_connections, connection
+from django.db import close_old_connections, connection, transaction
 from django.db.models.fields.files import FieldFile
 from django.test import (
     RequestFactory,
@@ -40,6 +41,7 @@ from videos.cache import VIDEO_CATALOG_CACHE_KEY
 from videos.media_cleanup import cleanup_video_artifacts
 from videos.models import Video
 from videos.tasks import (
+    claim_video_processing,
     cleanup_deleted_video,
     complete_video_processing,
     enqueue_video_processing,
@@ -197,6 +199,35 @@ def admin_form_data():
     }
 
 
+def admin_replacement_form(video):
+    """Build a valid bound admin form that replaces one video source."""
+    data = admin_form_data()
+    data["status"] = video.status
+    files = admin_uploads("replacement.mp4", None, b"\x00\x00\x00\x18ftyp")
+    return VideoAdminForm(data=data, files=files, instance=video)
+
+
+def admin_metadata_form(video):
+    """Build an admin form that changes metadata without a new source."""
+    data = {
+        "title": "Edited during processing",
+        "description": "Updated description",
+        "category": "Updated category",
+        "status": video.status,
+    }
+    return VideoAdminForm(data=data, instance=video)
+
+
+def create_processing_admin_video():
+    """Create a processing row for admin form regression tests."""
+    return Video.objects.create(
+        title="Metadata film",
+        category="Drama",
+        video_file="videos/source/metadata.mp4",
+        status=Video.STATUS_PROCESSING,
+    )
+
+
 def new_admin_video():
     """Build a saved admin video fixture with a small source upload."""
     return Video(
@@ -276,6 +307,35 @@ def process_video_in_thread(video_id):
         return process_video(video_id)
     finally:
         close_old_connections()
+
+
+def claim_video_in_thread(video_id, started, backend_pids):
+    """Claim video work through an independently opened DB connection."""
+    close_old_connections()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_backend_pid()")
+            backend_pids.append(cursor.fetchone()[0])
+        started.set()
+        return claim_video_processing(video_id)
+    finally:
+        close_old_connections()
+
+
+def wait_for_database_lock(backend_pid):
+    """Wait until PostgreSQL confirms the worker is blocked on a row lock."""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s",
+                (backend_pid,),
+            )
+            row = cursor.fetchone()
+        if row and row[0] == "Lock":
+            return
+        threading.Event().wait(0.01)
+    raise TimeoutError("The worker did not wait for the admin row lock.")
 
 
 def block_first_conversion(
@@ -791,6 +851,81 @@ class VideoProcessingConcurrencyTests(TransactionTestCase):
         self.assertEqual(video.status, Video.STATUS_READY)
 
 
+class VideoAdminWorkerLockTests(TransactionTestCase):
+    """Verify admin edits serialize with independent PostgreSQL workers."""
+
+    def test_admin_lock_covers_form_validation_and_save_model(self):
+        """Make a waiting worker claim the committed replacement source."""
+        with TemporaryDirectory() as temporary:
+            self.assert_admin_lock_serializes_worker(Path(temporary))
+
+    def assert_admin_lock_serializes_worker(self, media_root):
+        """Hold the admin transaction while an independent claim waits."""
+        with override_settings(**media_settings(media_root)):
+            video, form = ready_video_replacement(media_root)
+            self.run_locked_admin_save(video, form)
+
+    def run_locked_admin_save(self, video, form):
+        """Require PostgreSQL to show a worker blocked through model save."""
+        started = threading.Event()
+        backend_pids = []
+        with (
+            patch("videos.admin.transaction.on_commit"),
+            patch("videos.admin.enqueue_video_processing") as enqueue,
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            claim = self.save_while_worker_waits(
+                video, form, executor, started, backend_pids
+            )
+            claimed = claim.result(timeout=10)
+        self.assert_claim_uses_replacement(video, claimed, enqueue)
+
+    def save_while_worker_waits(
+        self, video, form, executor, started, backend_pids
+    ):
+        """Keep the admin row lock while the worker attempts its claim."""
+        with transaction.atomic():
+            self.assertTrue(form.is_valid(), form.errors)
+            claim = executor.submit(
+                claim_video_in_thread, video.pk, started, backend_pids
+            )
+            self.wait_until_claim_is_blocked(started, backend_pids)
+            self.save_admin_form(video, form)
+            self.assertFalse(claim.done())
+        return claim
+
+    def save_admin_form(self, video, form):
+        """Persist the replacement inside the locked admin transaction."""
+        obj = form.save(commit=False)
+        admin.site._registry[Video].save_model(None, obj, form, True)
+        self.assertEqual(obj.status, Video.STATUS_PENDING)
+        self.assertEqual(obj.video_file.name, "videos/source/replacement.mp4")
+
+    def wait_until_claim_is_blocked(self, started, backend_pids):
+        """Observe the worker's PostgreSQL lock wait before committing."""
+        self.assertTrue(started.wait(timeout=10))
+        wait_for_database_lock(backend_pids[0])
+
+    def assert_claim_uses_replacement(self, video, claimed, enqueue):
+        """Verify the worker sees the new path after transaction commit."""
+        self.assertEqual(claimed[0], video.video_file.path)
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_PROCESSING)
+        enqueue.assert_not_called()
+
+
+def ready_video_replacement(media_root):
+    """Build a ready video row and valid replacement admin form."""
+    video = Video.objects.create(
+        title="Ready film",
+        category="Drama",
+        video_file="videos/source/ready.mp4",
+        status=Video.STATUS_READY,
+    )
+    write_test_media(media_root, video.video_file.name)
+    return video, admin_replacement_form(video)
+
+
 class VideoModelTests(TestCase):
     """Verify catalog metadata and lifecycle model defaults."""
 
@@ -869,6 +1004,63 @@ class VideoAdminTests(TestCase):
         """Reprocess replacements without sacrificing metadata editing."""
         with TemporaryDirectory() as temporary:
             self.assert_source_replacement_is_safe(Path(temporary))
+
+    def test_processing_source_change_is_rejected_without_side_effects(self):
+        """Preserve active worker files and queue after a rejected edit."""
+        with TemporaryDirectory() as temporary:
+            self.assert_processing_source_is_unchanged(Path(temporary))
+
+    def assert_processing_source_is_unchanged(self, media_root):
+        """Reject the source change without touching active job artifacts."""
+        with override_settings(**media_settings(media_root)):
+            video, source = processing_fixture(media_root)
+            self.assert_replacement_form_rejected(video, source, media_root)
+
+    def assert_replacement_form_rejected(self, video, source, media_root):
+        """Assert field validation does not save or queue rejected uploads."""
+        hls = write_test_media(
+            media_root, f"videos/hls/{video.pk}/480p/index.m3u8"
+        )
+        form = admin_replacement_form(video)
+        with patch("videos.admin.enqueue_video_processing") as enqueue:
+            self.assertFalse(form.is_valid())
+        self.assertIn("video_file", form.errors)
+        self.assertTrue(form.errors["video_file"][0].startswith("The source"))
+        self.assert_rejected_video_unchanged(video, source, hls, enqueue)
+
+    def assert_rejected_video_unchanged(self, video, source, hls, enqueue):
+        """Verify database media state and queue remain unchanged."""
+        video.refresh_from_db()
+        self.assertEqual(video.status, Video.STATUS_PROCESSING)
+        expected_name = source.relative_to(settings.MEDIA_ROOT).as_posix()
+        self.assertEqual(video.video_file.name, expected_name)
+        self.assertTrue(source.exists())
+        self.assertTrue(hls.exists())
+        enqueue.assert_not_called()
+
+    def test_metadata_remains_editable_during_processing(self):
+        """Save catalog metadata without requeueing an active video."""
+        video = create_processing_admin_video()
+        self.save_metadata_during_processing(video)
+
+    def save_metadata_during_processing(self, video):
+        """Submit metadata changes without changing the source field."""
+        form = admin_metadata_form(video)
+        self.assertTrue(form.is_valid(), form.errors)
+        with patch("videos.admin.enqueue_video_processing") as enqueue:
+            admin.site._registry[Video].save_model(
+                None, form.save(commit=False), form, True
+            )
+        self.assert_metadata_saved(video, enqueue)
+
+    def assert_metadata_saved(self, video, enqueue):
+        """Confirm active processing status survives metadata-only edits."""
+        video.refresh_from_db()
+        self.assertEqual(video.title, "Edited during processing")
+        self.assertEqual(video.description, "Updated description")
+        self.assertEqual(video.category, "Updated category")
+        self.assertEqual(video.status, Video.STATUS_PROCESSING)
+        enqueue.assert_not_called()
 
     def assert_source_replacement_is_safe(self, media_root):
         """Persist a replacement, then verify cleanup and queue callbacks."""

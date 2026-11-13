@@ -23,6 +23,25 @@ class VideoAdminForm(forms.ModelForm):
         model = Video
         fields = "__all__"
 
+    def clean(self):
+        """Reject source replacement while a worker owns this video row."""
+        cleaned_data = super().clean()
+        if self.source_is_processing():
+            self.add_error(
+                "video_file",
+                "The source file cannot be changed during processing.",
+            )
+        return cleaned_data
+
+    def source_is_processing(self):
+        """Lock the current row when the submitted source file changed."""
+        if not self.instance.pk or "video_file" not in self.changed_data:
+            return False
+        video = Video.objects.select_for_update().filter(
+            pk=self.instance.pk
+        ).only("status").first()
+        return video is not None and video.status == Video.STATUS_PROCESSING
+
     def clean_video_file(self):
         """Allow supported video extensions within the configured size cap."""
         return validate_video_upload(self.cleaned_data["video_file"])
