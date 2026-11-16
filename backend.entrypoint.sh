@@ -29,8 +29,7 @@ PY
     else
         echo "Skipping automatic superuser creation; set all DJANGO_SUPERUSER_* values."
     fi
-    # Start RQ with the web process as in the course's three-service setup.
-    python manage.py rqworker default &
+    exec python -m core.process_supervisor "$@"
 fi
 
 exec "$@"

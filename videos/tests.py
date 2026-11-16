@@ -10,9 +10,10 @@ from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import django_rq
+from core import process_supervisor
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
@@ -2180,3 +2181,24 @@ class VideoEdgeCaseCoverageTests(TestCase):
         self.assertTrue(
             has_image_signature(".png", b"\x89PNG\r\n\x1a\ndata")
         )
+
+
+class ProcessSupervisorTests(SimpleTestCase):
+    """Verify a stopped RQ worker shuts down its web process."""
+
+    @patch("core.process_supervisor.time.sleep")
+    @patch("core.process_supervisor.signal.signal")
+    @patch("core.process_supervisor.subprocess.Popen")
+    def test_worker_exit_stops_web_process(self, popen, signal, _sleep):
+        """Return the worker error and terminate Gunicorn."""
+        worker = Mock()
+        worker.poll.side_effect = [None, 2, 2, 2]
+        worker.wait.return_value = 2
+        web = Mock()
+        web.poll.side_effect = [None, None]
+        popen.side_effect = [worker, web]
+        result = process_supervisor.run_services(["gunicorn"])
+        self.assertEqual(result, 2)
+        web.terminate.assert_called_once_with()
+        worker.wait.assert_called_once_with(timeout=10)
+        web.wait.assert_called_once_with(timeout=10)
