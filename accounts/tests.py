@@ -27,7 +27,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.test import APIClient, APIRequestFactory, APITestCase
@@ -1506,3 +1506,71 @@ def submit_password_confirmation(url, payload):
         format="json",
         HTTP_ORIGIN="http://127.0.0.1:5500",
     )
+
+
+class AccountUtilityRegressionTests(TestCase):
+    """Cover security and failure paths in account support utilities."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            "utility@example.com", "StrongPass!73"
+        )
+
+    def test_activation_mail_rejects_missing_frontend_configuration(self):
+        from accounts.emails import send_activation_email
+
+        with override_settings(FRONTEND_BASE_URL=""):
+            with self.assertRaises(EmailDeliveryError):
+                send_activation_email(self.user)
+
+    def test_registration_serializer_rejects_non_mapping_input(self):
+        serializer = RegistrationSerializer()
+        with self.assertRaises(serializers.ValidationError):
+            serializer.to_internal_value([])
+
+    def test_refresh_hash_check_can_be_disabled_by_setting(self):
+        from accounts.utils import refresh_token_matches_user
+
+        with patch("accounts.utils.api_settings.CHECK_REVOKE_TOKEN", False):
+            self.assertTrue(refresh_token_matches_user({}, self.user))
+
+    def test_refresh_cookie_is_optional_when_rotation_is_disabled(self):
+        from accounts.utils import set_refreshed_cookies
+
+        response = Response()
+        access = str(AccessToken.for_user(self.user))
+        set_refreshed_cookies(response, {"access": access})
+        self.assertIn(settings.JWT_ACCESS_COOKIE_NAME, response.cookies)
+        self.assertNotIn(settings.JWT_REFRESH_COOKIE_NAME, response.cookies)
+
+    def test_blacklisting_an_already_used_refresh_token_is_rejected(self):
+        from rest_framework_simplejwt.exceptions import TokenError
+
+        from accounts.utils import blacklist_refresh_token
+
+        token = str(RefreshToken.for_user(self.user))
+        blacklist_refresh_token(token)
+        with self.assertRaises(TokenError):
+            blacklist_refresh_token(token)
+
+    def test_reset_for_unknown_user_returns_controlled_failure(self):
+        from accounts.utils import process_password_reset
+
+        self.assertEqual(
+            process_password_reset(999999, "invalid", {}), (None, None)
+        )
+
+    def test_unrelated_integrity_error_is_re_raised(self):
+        from accounts.utils import handle_integrity_error
+
+        error = IntegrityError("unrelated constraint")
+        with self.assertRaises(IntegrityError) as raised:
+            handle_integrity_error(error)
+        self.assertIs(raised.exception, error)
+
+    def test_wsgi_and_asgi_application_entrypoints_load(self):
+        from core.asgi import application as asgi_application
+        from core.wsgi import application as wsgi_application
+
+        self.assertTrue(callable(asgi_application))
+        self.assertTrue(callable(wsgi_application))
