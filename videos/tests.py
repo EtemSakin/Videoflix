@@ -91,6 +91,16 @@ def media_settings(media_root):
     }
 
 
+def pipeline_queue_settings():
+    """Keep FFmpeg integration jobs on a Redis database for testing."""
+    return {
+        "default": {
+            "URL": "redis://redis:6379/9",
+            "DEFAULT_TIMEOUT": 3600,
+        }
+    }
+
+
 def write_test_media(media_root, relative_name):
     """Write a small managed file and return its absolute filesystem path."""
     path = media_root / relative_name
@@ -1804,17 +1814,16 @@ class VideoPipelineIntegrationTests(TransactionTestCase):
 
     def configure_pipeline_settings(self):
         """Isolate media outputs and queue jobs from development services."""
+        queue_settings = pipeline_queue_settings()
         self.enterContext(override_settings(
             MEDIA_ROOT=self.media_root,
             VIDEO_HLS_ROOT=self.hls_root,
             VIDEO_THUMBNAIL_ROOT=self.media_root / "videos" / "thumbnails",
-            RQ_QUEUES={
-                "default": {
-                    "URL": "redis://redis:6379/9",
-                    "DEFAULT_TIMEOUT": 3600,
-                }
-            },
+            RQ_QUEUES=queue_settings,
         ))
+        self.enterContext(
+            patch("django_rq.settings.QUEUES", queue_settings)
+        )
 
     def authenticate_client(self):
         """Authenticate playback requests with the project's JWT cookie."""
