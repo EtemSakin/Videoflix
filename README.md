@@ -15,9 +15,9 @@ The official Docker setup defines `web`, `db`, and `redis` and the environment
 variables documented in its `.env.template`. This project uses those service
 and environment names, including the worker running in the web container.
 The project keeps version-pinned images and database and Redis health checks.
-Unlike the sample, it uses a Django development server rather than Gunicorn.
-These differences are documented rather than claiming byte-for-byte parity
-with the course files.
+Gunicorn serves the API and WhiteNoise serves Django Admin static files, as in
+the course setup. Version-pinned images, health checks and committed-only
+migrations remain deliberate deviations from the starter files.
 
 ## Start locally
 
@@ -48,7 +48,8 @@ The API is available at <http://127.0.0.1:8000/>. Only the web port is
 published, bound to the local machine. PostgreSQL and Redis are available to
 the other Compose services on the private Compose network. Compose waits for
 healthy PostgreSQL and Redis services before starting Django. The web
-entrypoint starts RQ after applying database migrations.
+entrypoint applies committed migrations and collects static files before
+starting the background RQ worker and Gunicorn.
 
 On each web server start, the entrypoint applies committed migrations and
 creates a superuser when all three `DJANGO_SUPERUSER_*` variables are set. It

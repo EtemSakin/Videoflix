@@ -54,14 +54,14 @@
   catalog state, the console had no errors, and `document.cookie` was empty.
   The official frontend checkout itself was not modified.
 
-## Pending checks after worker consolidation
+## Pending checks after three-service and Gunicorn alignment
 
 - **Not yet verified:** Fresh-checkout Compose startup, RQ job processing,
   PostgreSQL test suite, branch coverage, and frontend playback with the
-  three-service layout. The 210-test and 100% coverage measurements above
-  are historical results from before this Docker adjustment.
+  three-service and Gunicorn layout. The 210-test and 100% coverage numbers
+  above are historical results from before these final runtime adjustments.
 - Do not merge this branch until the new Docker layout has passed its
-  integration checks and a worker failure/restart smoke check.
+  integration checks, a static-file smoke check, and an RQ worker smoke check.
 
 ## Differences and intentional deviations
 
@@ -72,10 +72,10 @@ environment names while retaining the previous aliases.
 
 The official Docker sample uses mutable database/cache tags and starts its
 worker with the web process. This branch follows its three-service layout
-and runs the RQ worker in the web container, while retaining pinned images
-and health checks. The entrypoint applies committed migrations instead of
-running `makemigrations` at startup. The web service still uses Django's
-development server instead of Gunicorn. These differences are documented in
+and runs the RQ worker in the web container. Gunicorn and WhiteNoise serve the
+API and static assets, following the course model. The project still retains
+pinned images and health checks, and applies committed migrations instead of
+running `makemigrations` at startup. These differences are documented in
 `README.md`; upstream course materials were not edited or copied.
 
 The course checklist says not to change Docker files received from its setup.

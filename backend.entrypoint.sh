@@ -1,14 +1,14 @@
 #!/bin/sh
 set -eu
 
-if [ "${1:-}" = "python" ] && [ "${2:-}" = "manage.py" ] \
-    && [ "${3:-}" = "runserver" ]; then
+if [ "${1:-}" = "gunicorn" ]; then
     SECRET_KEY="${SECRET_KEY:-${DJANGO_SECRET_KEY:-}}"
     DB_PASSWORD="${DB_PASSWORD:-${POSTGRES_PASSWORD:-}}"
     : "${SECRET_KEY:?Set SECRET_KEY in .env}"
     : "${DB_PASSWORD:?Set DB_PASSWORD in .env}"
     export SECRET_KEY DB_PASSWORD
     python manage.py migrate --noinput
+    python manage.py collectstatic --noinput
 
     if [ -n "${DJANGO_SUPERUSER_USERNAME:-}" ] \
         && [ -n "${DJANGO_SUPERUSER_PASSWORD:-}" ] \

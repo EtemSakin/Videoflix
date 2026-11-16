@@ -35,7 +35,7 @@ services:
     build:
       context: .
       dockerfile: backend.Dockerfile
-    command: ["python", "manage.py", "runserver", "0.0.0.0:8000"]
+    command: ["gunicorn", "core.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
     env_file:
       - path: .env
         required: false
