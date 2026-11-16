@@ -48,8 +48,10 @@ The API is available at <http://127.0.0.1:8000/>. Only the web port is
 published, bound to the local machine. PostgreSQL and Redis are available to
 the other Compose services on the private Compose network. Compose waits for
 healthy PostgreSQL and Redis services before starting Django. The web
-entrypoint applies committed migrations and collects static files before
-starting the background RQ worker and Gunicorn.
+entrypoint applies committed migrations and collects static files, then
+supervises the RQ worker and Gunicorn as child processes. If either process
+exits, the supervisor stops the other so Docker can restart the web container
+instead of silently leaving the API without a worker.
 
 On each web server start, the entrypoint applies committed migrations and
 creates a superuser when all three `DJANGO_SUPERUSER_*` variables are set. It
@@ -180,6 +182,50 @@ docker compose exec web python -m coverage report --precision=2 --fail-under=95
 The report covers application code in `core`, `accounts`, and `videos`; test
 modules and generated migrations are excluded. Coverage.py is a development
 tool and is not required by the application at runtime.
+
+## Final verification snapshot
+
+On 2026-11-16, the isolated PostgreSQL test database ran **211 tests with no
+failures or skips**. Branch-aware coverage was **99.53% for statements** and
+**98.68% for branches** (1,267 statements and 228 branches; six statements
+and three branch outcomes remain uncovered in the process supervisor).
+`coverage report --fail-under=95` passed. The suite includes the ten API
+routes, email flows using Django's in-memory backend, security regressions,
+and an RQ/FFmpeg processing integration test.
+
+The isolated Docker smoke test built and started `web`, `db`, and `redis`.
+PostgreSQL and Redis health checks passed; automatic migrations and test
+superuser creation completed; Gunicorn served the API; and WhiteNoise returned
+the Django Admin CSS with HTTP 200. A worker-kill test caused the supervised
+web container to restart with Gunicorn and RQ available again. During a Redis
+outage the worker logged retries, then completed a queued job after Redis
+recovered. Container recreation preserved database and media data.
+
+A real 12-second test video uploaded through Django Admin was processed by
+RQ and FFmpeg. Its thumbnail, HLS manifest, and segments were present for
+480p, 720p, and 1080p. The official frontend was tested from a temporary copy
+against the isolated backend: login, catalog, playback, all three rendition
+manifests and segments, and logout succeeded; the browser reported no console
+errors. The JWT cookies were HttpOnly and were removed on logout. The original
+frontend repository was not modified.
+
+The direct HTTP client confirmed that unsafe API requests need an `Origin`
+listed in `CORS_ALLOWED_ORIGINS`; a missing or untrusted origin returns 403.
+The default local frontend origin is `http://127.0.0.1:5500`. Django's system
+check and the no-pending-migrations check passed.
+
+The explicit Ruff docstring check passed. The general Ruff run still reports
+79 diagnostics: 41 executable-bit findings caused by Docker image file modes
+(Python files are tracked as non-executable), 29 nested-context style findings
+in tests, seven mutable class-default findings in Django model/migration
+metadata, and two import-order findings. A strict 79-character E/F check finds
+six long lines, and the source audit finds nine test functions over 14 physical
+lines; all 173 production functions meet the 14-line limit. These are recorded
+as unresolved course-style deviations, separate from functional and security
+results.
+
+Real external SMTP delivery, production HTTPS behavior, and public deployment
+were not tested. Automated email tests use Django's in-memory email backend.
 
 ## Troubleshooting
 
