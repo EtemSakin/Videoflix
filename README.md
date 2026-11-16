@@ -164,6 +164,22 @@ checks above are read-only checks. The Redis ping inspects the configured RQ
 connection; worker status and processing output are available through
 `docker compose ps` and `docker compose logs worker`.
 
+To measure branch-aware coverage, install Coverage.py in the running web
+container, then run the suite and enforce the project's 95% threshold:
+
+```sh
+docker compose exec web python -m pip install coverage
+docker compose exec web python -m coverage erase
+docker compose exec web python -m coverage run \
+  --branch --source=core,accounts,videos \
+  --omit='*/tests.py,*/migrations/*' manage.py test
+docker compose exec web python -m coverage report --precision=2 --fail-under=95
+```
+
+The report covers application code in `core`, `accounts`, and `videos`; test
+modules and generated migrations are excluded. Coverage.py is a development
+tool and is not required by the application at runtime.
+
 ## Troubleshooting
 
 - **Docker engine unavailable:** Start Docker Desktop and confirm

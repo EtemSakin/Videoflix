@@ -1,67 +1,93 @@
-# Videoflix Backend Delivery
+# Videoflix Backend Alignment Delivery
 
-**Review date:** 2026-11-06
+**Review date:** 2026-11-16
 
-## Verified implementation
+**Working branch:** `chore/align-course-setup`
 
-- The backend implements the ten documented API routes for registration,
-  activation, login, logout, token refresh, password reset, video listing,
-  HLS manifests, and HLS segments.
-- The final PostgreSQL-backed suite passed: **181 tests**.
-- Branch-aware Coverage.py measured **95%** across `accounts` and `videos`,
-  excluding test modules and migrations. Coverage.py ran only in a disposable
-  test container; it is not a runtime dependency.
-- Ruff, the project's 79-character line target, PEP 257 for the updated tests,
-  the 14-physical-line function check, Django's system check, and
-  `makemigrations --check --dry-run` passed.
-- The real video pipeline test generated HLS outputs for all three required
-  resolutions using FFmpeg and a real RQ job.
+## Course-standard alignment
 
-## Clean-clone Docker smoke check
+- The ten documented account, authentication, password-reset, catalog, HLS
+  manifest, and segment endpoints keep their existing paths and response
+  contracts. JWTs remain in HttpOnly cookies.
+- `.env.template` uses the official course names for the Django superuser,
+  database, Redis, Django, and SMTP settings. `core/settings.py` also accepts
+  the existing project aliases so local `.env` files can be migrated without
+  changing credentials.
+- Compose now exposes the course service names `web`, `db`, and `redis`. The
+  project keeps a separate `worker`, pinned image versions, health checks,
+  and persistent media, PostgreSQL, and Redis volumes.
+- The web entrypoint applies committed migrations and optionally bootstraps
+  the configured course superuser. It does not generate migrations at
+  container startup. The custom email-login user has an optional unique
+  `username` for that bootstrap; migration `0002_user_username` only adds a
+  nullable column.
+- The project keeps its `core`, `accounts`, and `videos` Django apps. Renaming
+  them to names used by some student repositories would add migration and
+  app-label risk without changing the official API.
+- No student repository code was copied. The official Docker materials and
+  endpoint/checklist documents were used as references.
 
-A Windows checkout with `core.autocrlf=true` initially converted
-`backend.entrypoint.sh` to CRLF. Docker then restarted the backend and worker
-because the shell rejected `set -eu`. `.gitattributes` now pins that script to
-LF; a new checkout with this rule produced zero CRLF pairs.
+## Verification on 2026-11-16
 
-After the entrypoint was normalized in the disposable clone, the complete
-Compose stack built and started. PostgreSQL and Redis became healthy, Django
-started without system-check errors, and the worker listened on the `default`
-queue. The smoke check applied all 33 migrations only to the isolated
-`videoflix-commit40` PostgreSQL volume. It verified Django's PostgreSQL
-connection, a Django cache write/read through Redis, FFmpeg in the backend and
-worker, and the anonymous video-list response (`401`).
+- A local fresh clone at commit `238a6b8` passed `docker compose config
+  --quiet` and `docker compose up --build -d`. PostgreSQL, Redis, and web
+  became healthy; the worker started after web health. The web entrypoint
+  applied all committed migrations, including the additive username
+  migration. The test-only stack used a separate port and newly created
+  volumes; no existing database or Docker volume was removed.
+- The PostgreSQL-backed Django suite passed: **210 tests**. Coverage.py ran
+  with branch measurement across `core`, `accounts`, and `videos`, excluding
+  only test modules and generated migrations. It reported **100.00% line
+  coverage and 100.00% branch coverage** (1,230 statements and 214 branches).
+  `coverage report --fail-under=95` passed.
+- `manage.py check`, `makemigrations --check --dry-run`, Ruff, and Compose
+  configuration validation passed. FFmpeg 5.1.9 was available in the fresh
+  application image. Redis ping returned `True`, and a job submitted to the
+  running RQ worker completed with result `6`.
+- The integration suite processed a real test video through RQ and FFmpeg,
+  checked the 480p, 720p, and 1080p renditions, and fetched protected HLS
+  manifests and segments.
+- The official frontend checkout was served from a temporary copy with its
+  API base redirected to the isolated test port. Browser login and the
+  protected video catalog returned HTTP 200, the page reached the empty
+  catalog state, the console had no errors, and `document.cookie` was empty.
+  The official frontend checkout itself was not modified.
 
-The separate Docker worker processed a generated two-second test clip. The
-database status became `ready`; a thumbnail and the `480p`, `720p`, and `1080p`
-rendition directories were present in the shared media volume.
+## Differences and intentional deviations
 
-## External prerequisites and limits
+The repository's original Compose service was named `backend` and used the
+older `DJANGO_*` and `POSTGRES_*` variables. Those project-owned files were
+updated to expose the official `web` service and accept the official
+environment names while retaining the previous aliases.
 
-- Real registration, activation, and password-reset delivery requires the
-  owner to provide valid SMTP settings in the private local `.env`. No SMTP
-  credentials were available for a real external delivery test; automated
-  email tests use Django's in-memory test backend.
-- A manual browser check used a pre-created active test account. Login and the
-  video catalog succeeded; a generated three-second clip played through the
-  official frontend's HLS.js player at 480p. The browser received HTTP 200 for
-  the manifest and segment, both video elements reached `readyState` 4, and
-  the browser console showed no errors.
-- This browser check did not cover registration, clicking a real activation
-  email, SMTP delivery, or selecting 720p/1080p in the frontend. The isolated
-  RQ/FFmpeg integration test covered all three rendition outputs and their
-  authenticated API delivery. Automated email tests use Django's in-memory
-  backend.
-- Account-enumeration risk remains at registration because the documented
-  duplicate-account response differs from successful registration. Password
-  reset returns the same response for known and unknown addresses, but sends
-  existing-account mail synchronously, so response timing can still differ.
-  Login uses a generic credential error; no claim of complete timing
-  indistinguishability is made.
-- Public deployment is not required by the official assignment. No service
-  was deployed publicly.
+The official Docker sample uses mutable database/cache tags and starts its
+worker with the web process. This project retains pinned images, health
+checks, and a separate worker so the worker can restart independently. The
+entrypoint applies committed migrations instead of running `makemigrations`
+at startup. The web container uses Django's development server for this local
+course stack. These choices are documented in `README.md`; the official
+materials repository was not edited or vendored.
 
-The [official Developer-Akademie Docker files](https://github.com/Developer-Akademie-Backendkurs/material.videoflix-docker-files)
-are relevant course setup material. This repository's Compose configuration
-and environment variables are its implemented runtime contract; use the
-instructions in `README.md` for this backend.
+The course checklist says not to change Docker files received from its setup.
+The files in this repository were not byte-for-byte copies of that setup, so
+this branch adapted the repository's own Docker files rather than replacing
+them with upstream files. If the evaluator requires the supplied Docker
+files to remain byte-for-byte unchanged, that remains a rubric-specific
+deviation to confirm with the mentor.
+
+## Remaining limits and risks
+
+- SMTP delivery was not tested against a real provider because no SMTP
+  credentials were available. Registration, activation, and reset email
+  behavior is covered with Django's in-memory test backend.
+- Browser verification covered login and the protected catalog. Registration
+  activation and password-reset UI flows were not driven through a real inbox;
+  their API and email-template flows are covered by automated tests.
+- No public deployment or HTTPS production environment was requested or
+  tested. The Docker verification used a disposable test project and
+  credentials, not a shared or production database.
+- Registration intentionally returns a different response for a duplicate
+  email, as required by the current API contract. Password-reset responses
+  remain generic, though synchronous email delivery can affect timing.
+- Unsafe API writes without a trusted `Origin` are rejected. Direct curl or
+  Postman writes therefore need an allowed `Origin` header.
