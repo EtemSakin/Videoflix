@@ -1,7 +1,8 @@
 # Videoflix Backend
 
 Videoflix is a Django REST API for account management and a protected video
-catalog. Docker Compose runs the backend, PostgreSQL, Redis, and an RQ worker.
+catalog. Docker Compose runs Django, PostgreSQL, and Redis in the course's three-service
+layout. The web entrypoint starts an RQ worker alongside the Django server.
 FFmpeg is installed in the application image.
 
 ## Prerequisites
@@ -12,12 +13,11 @@ FFmpeg is installed in the application image.
 
 The official Docker setup defines `web`, `db`, and `redis` and the environment
 variables documented in its `.env.template`. This project uses those service
-and environment names. It keeps version-pinned images and database and Redis
-health checks. The RQ worker runs as a separate Compose service so Docker can
-restart it independently from Django. The course sample starts the worker in
-the web entrypoint and uses `latest` database and Redis images. These are
-intentional runtime differences; the project does not copy or edit the files
-in the course materials repository.
+and environment names, including the worker running in the web container.
+The project keeps version-pinned images and database and Redis health checks.
+Unlike the sample, it uses a Django development server rather than Gunicorn.
+These differences are documented rather than claiming byte-for-byte parity
+with the course files.
 
 ## Start locally
 
@@ -47,8 +47,8 @@ docker compose ps
 The API is available at <http://127.0.0.1:8000/>. Only the web port is
 published, bound to the local machine. PostgreSQL and Redis are available to
 the other Compose services on the private Compose network. Compose waits for
-their health checks before starting Django; the worker waits for Django's
-health check as well.
+healthy PostgreSQL and Redis services before starting Django. The web
+entrypoint starts RQ after applying database migrations.
 
 On each web server start, the entrypoint applies committed migrations and
 creates a superuser when all three `DJANGO_SUPERUSER_*` variables are set. It
@@ -84,12 +84,12 @@ as the sender address.
 1. Open <http://127.0.0.1:8000/admin/> and sign in with the superuser.
 2. Add a video with its title, category, and source file. The admin validates
    the upload and queues processing after the database transaction commits.
-3. Keep the worker running. It uses the shared media volume and FFmpeg to
-   generate the 480p, 720p, and 1080p HLS renditions and thumbnail.
+3. Keep the web service running. Its RQ worker shares the media volume and
+   uses FFmpeg to generate HLS in 480p, 720p and 1080p and the thumbnail.
 4. Check progress and errors with:
 
 ```sh
-docker compose logs -f worker
+docker compose logs -f web
 ```
 
 Uploaded source files, thumbnails, and HLS output are stored in the persistent
@@ -162,7 +162,7 @@ The test runner creates and tears down its test database; it does not apply
 test migrations to the normal development database. The migration and system
 checks above are read-only checks. The Redis ping inspects the configured RQ
 connection; worker status and processing output are available through
-`docker compose ps` and `docker compose logs worker`.
+`docker compose ps` and `docker compose logs web`.
 
 To measure branch-aware coverage, install Coverage.py in the running web
 container, then run the suite and enforce the project's 95% threshold:
@@ -191,10 +191,9 @@ tool and is not required by the application at runtime.
   `docker compose logs --tail=100 db`; wait until the database health check
   passes before retrying.
 - **Redis or worker issues:** Inspect `docker compose logs --tail=100 redis`
-  and `docker compose logs --tail=100 worker`. The worker consumes the `default`
-  RQ queue.
+  and `docker compose logs --tail=100 web`. The web service starts an RQ worker for the `default` queue.
 - **Code or dependency changes not visible:** Rebuild and recreate the
-  application images with `docker compose up --build -d web worker`.
+  application images with `docker compose up --build -d web`.
 - **Missing FFmpeg:** Rebuild the application image, then check
   `docker compose exec web ffmpeg -version`.
 - **Frontend requests blocked:** Verify the frontend's exact origin in both

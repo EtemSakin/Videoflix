@@ -13,9 +13,9 @@
   database, Redis, Django, and SMTP settings. `core/settings.py` also accepts
   the existing project aliases so local `.env` files can be migrated without
   changing credentials.
-- Compose now exposes the course service names `web`, `db`, and `redis`. The
-  project keeps a separate `worker`, pinned image versions, health checks,
-  and persistent media, PostgreSQL, and Redis volumes.
+- Compose uses the three official service names: `web`, `db`, and `redis`.
+  The web entrypoint starts RQ inside the web service. Pinned image versions,
+  health checks, and persistent media, PostgreSQL, and Redis volumes remain.
 - The web entrypoint applies committed migrations and optionally bootstraps
   the configured course superuser. It does not generate migrations at
   container startup. The custom email-login user has an optional unique
@@ -31,10 +31,11 @@
 
 - A local fresh clone at commit `238a6b8` passed `docker compose config
   --quiet` and `docker compose up --build -d`. PostgreSQL, Redis, and web
-  became healthy; the worker started after web health. The web entrypoint
+  became healthy; the separate worker started after web health. The web entrypoint
   applied all committed migrations, including the additive username
   migration. The test-only stack used a separate port and newly created
-  volumes; no existing database or Docker volume was removed.
+  volumes; no existing database or Docker volume was removed. This result
+  predates the later switch to the three-service Compose layout.
 - The PostgreSQL-backed Django suite passed: **210 tests**. Coverage.py ran
   with branch measurement across `core`, `accounts`, and `videos`, excluding
   only test modules and generated migrations. It reported **100.00% line
@@ -53,6 +54,15 @@
   catalog state, the console had no errors, and `document.cookie` was empty.
   The official frontend checkout itself was not modified.
 
+## Pending checks after worker consolidation
+
+- **Not yet verified:** Fresh-checkout Compose startup, RQ job processing,
+  PostgreSQL test suite, branch coverage, and frontend playback with the
+  three-service layout. The 210-test and 100% coverage measurements above
+  are historical results from before this Docker adjustment.
+- Do not merge this branch until the new Docker layout has passed its
+  integration checks and a worker failure/restart smoke check.
+
 ## Differences and intentional deviations
 
 The repository's original Compose service was named `backend` and used the
@@ -61,12 +71,12 @@ updated to expose the official `web` service and accept the official
 environment names while retaining the previous aliases.
 
 The official Docker sample uses mutable database/cache tags and starts its
-worker with the web process. This project retains pinned images, health
-checks, and a separate worker so the worker can restart independently. The
-entrypoint applies committed migrations instead of running `makemigrations`
-at startup. The web container uses Django's development server for this local
-course stack. These choices are documented in `README.md`; the official
-materials repository was not edited or vendored.
+worker with the web process. This branch follows its three-service layout
+and runs the RQ worker in the web container, while retaining pinned images
+and health checks. The entrypoint applies committed migrations instead of
+running `makemigrations` at startup. The web service still uses Django's
+development server instead of Gunicorn. These differences are documented in
+`README.md`; upstream course materials were not edited or copied.
 
 The course checklist says not to change Docker files received from its setup.
 The files in this repository were not byte-for-byte copies of that setup, so
