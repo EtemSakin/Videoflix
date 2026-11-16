@@ -1,7 +1,7 @@
 # Secrets and local environment files.
 .env
 .env.*
-!.env.example
+!.env.template
 
 # Python environments, bytecode, and test or analysis output.
 .venv/

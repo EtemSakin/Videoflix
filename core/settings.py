@@ -9,14 +9,15 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
-DEBUG = os.getenv("DJANGO_DEBUG", "false").lower() in {
+SECRET_KEY = os.getenv("SECRET_KEY") or os.getenv("DJANGO_SECRET_KEY")
+DEBUG = (os.getenv("DEBUG") or os.getenv("DJANGO_DEBUG", "false")).lower() in {
     "1", "true", "yes"
 }
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.getenv(
-        "DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost"
+    for host in (
+        os.getenv("ALLOWED_HOSTS")
+        or os.getenv("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost")
     ).split(",")
     if host.strip()
 ]
@@ -40,6 +41,7 @@ AUTH_USER_MODEL = "accounts.User"
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "accounts.middleware.TrustedOriginMiddleware",
@@ -73,20 +75,26 @@ ASGI_APPLICATION = "core.asgi.application"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        "NAME": os.getenv("POSTGRES_DB", "videoflix"),
-        "USER": os.getenv("POSTGRES_USER", "videoflix"),
-        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
-        "HOST": os.getenv("POSTGRES_HOST", "127.0.0.1"),
-        "PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "NAME": os.getenv("DB_NAME") or os.getenv("POSTGRES_DB", "videoflix"),
+        "USER": os.getenv("DB_USER") or os.getenv("POSTGRES_USER", "videoflix"),
+        "PASSWORD": os.getenv("DB_PASSWORD") or os.getenv("POSTGRES_PASSWORD", ""),
+        "HOST": os.getenv("DB_HOST") or os.getenv("POSTGRES_HOST", "127.0.0.1"),
+        "PORT": os.getenv("DB_PORT") or os.getenv("POSTGRES_PORT", "5432"),
     }
 }
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_URL = os.getenv(
+    "REDIS_URL", f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+)
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",
         "LOCATION": os.getenv(
-            "REDIS_CACHE_URL", "redis://127.0.0.1:6379/1"
+            "REDIS_LOCATION",
+            os.getenv("REDIS_CACHE_URL", "redis://127.0.0.1:6379/1"),
         ),
     }
 }
@@ -160,7 +168,9 @@ EMAIL_USE_SSL = os.getenv("EMAIL_USE_SSL", "false").lower() in {
     "1", "true", "yes"
 }
 EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "10"))
-DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "")
+DEFAULT_FROM_EMAIL = (
+    os.getenv("DEFAULT_FROM_EMAIL") or os.getenv("EMAIL_HOST_USER", "")
+)
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "")
 VIDEO_MAX_UPLOAD_BYTES = int(
     os.getenv("VIDEO_MAX_UPLOAD_BYTES", str(1024**3))
@@ -195,7 +205,16 @@ TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 MEDIA_URL = "/media/"
 MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", str(BASE_DIR / "media")))
 VIDEO_SOURCE_ROOT = MEDIA_ROOT / "videos" / "source"

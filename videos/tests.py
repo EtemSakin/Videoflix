@@ -10,9 +10,10 @@ from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import django_rq
+from core import process_supervisor
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
@@ -88,6 +89,16 @@ def media_settings(media_root):
         "VIDEO_SOURCE_ROOT": videos_root / "source",
         "VIDEO_THUMBNAIL_ROOT": videos_root / "thumbnails",
         "VIDEO_HLS_ROOT": videos_root / "hls",
+    }
+
+
+def pipeline_queue_settings():
+    """Keep FFmpeg integration jobs on a Redis database for testing."""
+    return {
+        "default": {
+            "URL": "redis://redis:6379/9",
+            "DEFAULT_TIMEOUT": 3600,
+        }
     }
 
 
@@ -1804,17 +1815,16 @@ class VideoPipelineIntegrationTests(TransactionTestCase):
 
     def configure_pipeline_settings(self):
         """Isolate media outputs and queue jobs from development services."""
+        queue_settings = pipeline_queue_settings()
         self.enterContext(override_settings(
             MEDIA_ROOT=self.media_root,
             VIDEO_HLS_ROOT=self.hls_root,
             VIDEO_THUMBNAIL_ROOT=self.media_root / "videos" / "thumbnails",
-            RQ_QUEUES={
-                "default": {
-                    "URL": "redis://redis:6379/9",
-                    "DEFAULT_TIMEOUT": 3600,
-                }
-            },
+            RQ_QUEUES=queue_settings,
         ))
+        self.enterContext(
+            patch("django_rq.settings.QUEUES", queue_settings)
+        )
 
     def authenticate_client(self):
         """Authenticate playback requests with the project's JWT cookie."""
@@ -1911,3 +1921,284 @@ class VideoPipelineIntegrationTests(TransactionTestCase):
         )
         payload = b"".join(response.streaming_content)
         self.assertTrue(payload.startswith(b"\x47"))
+
+
+class VideoEdgeCaseCoverageTests(TestCase):
+    """Exercise defensive media and worker branches with focused fixtures."""
+
+    def test_retry_action_only_prepares_failed_videos(self):
+        failed = create_failed_admin_video()
+        pending = Video.objects.create(
+            title="Pending", category="Drama",
+            video_file="videos/source/pending.mp4",
+            status=Video.STATUS_PENDING,
+        )
+        model_admin = VideoAdmin(Video, admin.site)
+        request = RequestFactory().post("/admin/")
+        queryset = Video.objects.filter(pk__in=(failed.pk, pending.pk))
+        with patch.object(model_admin, "prepare_retry") as prepare:
+            model_admin.retry_failed_processing(request, queryset)
+            model_admin.retry_failed_processing(
+                request, Video.objects.filter(pk=pending.pk)
+            )
+        prepare.assert_called_once_with(failed)
+
+    def test_media_paths_outside_the_managed_root_are_rejected(self):
+        from videos.media_cleanup import resolve_managed_file
+
+        with TemporaryDirectory() as temporary:
+            media = Path(temporary) / "media"
+            allowed = media / "videos" / "source"
+            allowed.mkdir(parents=True)
+            other_file = media / "outside.mp4"
+            other_file.write_bytes(b"keep")
+            outside = Path(temporary) / "external"
+            outside.mkdir()
+            external_file = outside / "outside.mp4"
+            external_file.write_bytes(b"keep")
+            with override_settings(MEDIA_ROOT=media):
+                with patch(
+                    "videos.media_cleanup.default_storage.path",
+                    return_value=other_file,
+                ):
+                    self.assertIsNone(resolve_managed_file("name", allowed))
+                with patch(
+                    "videos.media_cleanup.default_storage.path",
+                    return_value=external_file,
+                ):
+                    self.assertIsNone(resolve_managed_file("name", outside))
+
+    def test_hls_cleanup_skips_files_and_roots_outside_media(self):
+        from videos.media_cleanup import remove_hls_directory
+
+        with TemporaryDirectory() as temporary:
+            media = Path(temporary) / "media"
+            hls_root = media / "videos" / "hls"
+            hls_root.mkdir(parents=True)
+            (hls_root / "1").write_bytes(b"keep")
+            external_root = Path(temporary) / "external-hls"
+            (external_root / "2").mkdir(parents=True)
+            with override_settings(
+                MEDIA_ROOT=media, VIDEO_HLS_ROOT=hls_root
+            ):
+                remove_hls_directory(1)
+            with override_settings(
+                MEDIA_ROOT=media, VIDEO_HLS_ROOT=external_root
+            ):
+                remove_hls_directory(2)
+            self.assertTrue((hls_root / "1").is_file())
+            self.assertTrue((external_root / "2").is_dir())
+
+    def test_media_cleanup_logs_filesystem_errors(self):
+        from videos.media_cleanup import (
+            remove_managed_directory,
+            unlink_managed_file,
+        )
+
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "artifact"
+            with patch.object(Path, "unlink", side_effect=OSError):
+                with self.assertLogs("videos.media_cleanup", level="ERROR"):
+                    unlink_managed_file(path)
+            with patch(
+                "videos.media_cleanup.shutil.rmtree", side_effect=OSError
+            ):
+                with self.assertLogs("videos.media_cleanup", level="ERROR"):
+                    remove_managed_directory(path)
+
+    def test_pre_delete_signal_handles_a_missing_database_row(self):
+        from videos.signals import lock_video_state_before_delete
+
+        video = Video(pk=999999, status=Video.STATUS_READY)
+        lock_video_state_before_delete(sender=Video, instance=video)
+        self.assertEqual(video.status, Video.STATUS_READY)
+
+    def test_worker_finishes_deleted_claims_and_missing_rows_safely(self):
+        from videos.tasks import (
+            claim_video_processing,
+            complete_video_processing,
+            handle_processing_failure,
+        )
+
+        with (
+            patch("videos.tasks.process_video_outputs", return_value=[]),
+            patch("videos.tasks.mark_processing_ready", return_value=False),
+            patch("videos.tasks.video_exists", return_value=False),
+            patch("videos.tasks.cleanup_deleted_video") as cleanup,
+        ):
+            self.assertEqual(
+                complete_video_processing(999999, "source", Path("hls")),
+                [],
+            )
+        cleanup.assert_called_once()
+        self.assertIsNone(claim_video_processing(999999))
+        with (
+            patch("videos.tasks.video_exists", return_value=False),
+            patch("videos.tasks.cleanup_hls_outputs"),
+            patch("videos.tasks.cleanup_deleted_video") as cleanup,
+        ):
+            handle_processing_failure(999999, "source", Path("hls"), [])
+        cleanup.assert_called_once()
+
+    def test_worker_cleanup_handles_unlink_failure_and_invalid_source(self):
+        from videos.tasks import cleanup_deleted_video, cleanup_hls_outputs
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "hls"
+            rendition = root / "480p"
+            rendition.mkdir(parents=True)
+            with patch("videos.tasks.shutil.rmtree", side_effect=OSError):
+                with self.assertLogs("videos.tasks", level="ERROR"):
+                    cleanup_hls_outputs([str(rendition)], root)
+            media = Path(temporary) / "media"
+            media.mkdir()
+            source = Path(temporary) / "external.mp4"
+            source.write_bytes(b"source")
+            with override_settings(MEDIA_ROOT=media):
+                with patch("videos.tasks.cleanup_video_artifacts") as cleanup:
+                    cleanup_deleted_video(4, source)
+            cleanup.assert_called_once_with(
+                4, None, "videos/thumbnails/4/thumbnail.jpg"
+            )
+
+    def test_worker_rejects_thumbnail_update_after_state_changes(self):
+        from videos.tasks import attach_video_thumbnail
+
+        video = Video.objects.create(
+            title="Pending", category="Drama",
+            video_file="videos/source/pending.mp4",
+            status=Video.STATUS_PENDING,
+        )
+        with patch(
+            "videos.tasks.generate_video_thumbnail",
+            return_value="videos/thumbnails/1/thumbnail.jpg",
+        ):
+            with self.assertRaises(Video.DoesNotExist):
+                attach_video_thumbnail(video.pk, "source.mp4")
+
+    def test_thumbnail_helpers_reject_symlinks_and_empty_files(self):
+        from videos.thumbnails import (
+            existing_thumbnail_is_valid,
+            validate_thumbnail_file,
+        )
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.jpg"
+            target.write_bytes(b"image")
+            link = root / "link.jpg"
+            link.symlink_to(target)
+            with self.assertRaises(ThumbnailGenerationError):
+                existing_thumbnail_is_valid(link)
+            empty = root / "empty.jpg"
+            empty.touch()
+            with self.assertRaises(ThumbnailGenerationError):
+                existing_thumbnail_is_valid(empty)
+            with self.assertRaises(ThumbnailGenerationError):
+                validate_thumbnail_file(root / "missing.jpg")
+            with self.assertRaises(ThumbnailGenerationError):
+                validate_thumbnail_file(empty)
+
+    def test_thumbnail_runner_preserves_ffmpeg_unavailable_errors(self):
+        from videos.thumbnails import run_thumbnail_command
+
+        error = FFmpegUnavailableError("FFmpeg unavailable")
+        with patch("videos.thumbnails.execute_ffmpeg", side_effect=error):
+            with self.assertRaises(FFmpegUnavailableError):
+                run_thumbnail_command(["ffmpeg"])
+
+    def test_hls_helpers_reject_existing_and_incomplete_outputs(self):
+        from videos.transcoding import (
+            reject_existing_output,
+            validate_hls_artifacts,
+        )
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            existing = root / "480p"
+            existing.mkdir()
+            with self.assertRaises(HLSConversionError):
+                reject_existing_output(existing)
+            output = root / "staged"
+            output.mkdir()
+            with self.assertRaises(HLSConversionError):
+                validate_hls_artifacts(output)
+            (output / "index.m3u8").write_text("#EXTM3U")
+            (output / "segment_00000.ts").touch()
+            with self.assertRaises(HLSConversionError):
+                validate_hls_artifacts(output)
+
+    def test_media_response_helpers_reject_invalid_paths_and_mime_types(self):
+        from videos.utils import (
+            manifest_response,
+            resolve_rendition_artifact,
+            resolve_segment_path,
+            thumbnail_response,
+        )
+
+        self.assertEqual(thumbnail_response(SimpleNamespace(thumbnail=None)).status_code, 404)
+        self.assertEqual(
+            thumbnail_response(SimpleNamespace(thumbnail=SimpleNamespace(name="file.txt"))).status_code,
+            404,
+        )
+        self.assertIsNone(resolve_segment_path(1, "480p", "unsafe.ts"))
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "hls"
+            rendition = root / "8" / "480p"
+            rendition.mkdir(parents=True)
+            outside = Path(temporary) / "outside.ts"
+            outside.write_bytes(b"segment")
+            self.assertIsNone(
+                resolve_rendition_artifact(root, 8, "480p", str(outside))
+            )
+            media = Path(temporary) / "media"
+            hls_root = media / "videos" / "hls"
+            manifest = hls_root / "9" / "480p" / "index.m3u8"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("#EXTM3U")
+            with override_settings(MEDIA_ROOT=media, VIDEO_HLS_ROOT=hls_root):
+                with patch("videos.utils.Path.open", side_effect=OSError):
+                    self.assertEqual(manifest_response(9, "480p").status_code, 404)
+
+    def test_segment_response_hides_file_open_errors(self):
+        from videos.utils import segment_response
+
+        with TemporaryDirectory() as temporary:
+            media = Path(temporary) / "media"
+            hls_root = media / "videos" / "hls"
+            segment = hls_root / "9" / "480p" / "segment_00000.ts"
+            segment.parent.mkdir(parents=True)
+            segment.write_bytes(b"segment")
+            with override_settings(MEDIA_ROOT=media, VIDEO_HLS_ROOT=hls_root):
+                with patch("videos.utils.Path.open", side_effect=OSError):
+                    response = segment_response(9, "480p", segment.name)
+        self.assertEqual(response.status_code, 404)
+
+    def test_image_validators_accept_jpeg_and_png_signatures(self):
+        from videos.validators import has_image_signature
+
+        self.assertTrue(has_image_signature(".jpg", b"\xff\xd8\xffdata"))
+        self.assertTrue(
+            has_image_signature(".png", b"\x89PNG\r\n\x1a\ndata")
+        )
+
+
+class ProcessSupervisorTests(SimpleTestCase):
+    """Verify a stopped RQ worker shuts down its web process."""
+
+    @patch("core.process_supervisor.time.sleep")
+    @patch("core.process_supervisor.signal.signal")
+    @patch("core.process_supervisor.subprocess.Popen")
+    def test_worker_exit_stops_web_process(self, popen, signal, _sleep):
+        """Return the worker error and terminate Gunicorn."""
+        worker = Mock()
+        worker.poll.side_effect = [None, 2, 2, 2]
+        worker.wait.return_value = 2
+        web = Mock()
+        web.poll.side_effect = [None, None]
+        popen.side_effect = [worker, web]
+        result = process_supervisor.run_services(["gunicorn"])
+        self.assertEqual(result, 2)
+        web.terminate.assert_called_once_with()
+        worker.wait.assert_called_once_with(timeout=10)
+        web.wait.assert_called_once_with(timeout=10)

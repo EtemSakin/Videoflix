@@ -10,12 +10,14 @@ from accounts.managers import UserManager
 class User(AbstractUser):
     """Represent a Videoflix account identified by its email address."""
 
-    username = None
+    username = models.CharField(
+        blank=True, max_length=150, null=True, unique=True
+    )
     email = models.EmailField(unique=True)
     objects = UserManager()
 
     USERNAME_FIELD = "email"
-    REQUIRED_FIELDS = []
+    REQUIRED_FIELDS = ("username",)
 
     class Meta:
         """Enforce case-insensitive email uniqueness in the database."""
